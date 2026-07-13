@@ -25,13 +25,20 @@ SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
 
 
 def fetch_day(day: datetime.date):
+    """Fetch the target day PLUS several prior days for SMMA warm-up, so
+    the moving average is continuous across sessions (like TradingView and
+    the live bot) instead of being seeded from the day's first candles.
+
+    Returns (warmup_candles, day_candles)."""
+    from datetime import timedelta
+
     client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
     client.login()
     raw = client.get_candles(
         exchange=config.UNDERLYING_EXCHANGE,
         symboltoken=config.UNDERLYING_TOKEN,
         interval=config.CANDLE_INTERVAL,
-        from_dt=datetime.combine(day, dtime(9, 15)),
+        from_dt=datetime.combine(day - timedelta(days=6), dtime(9, 15)),
         to_dt=datetime.combine(day, dtime(15, 30)),
     )
     client.logout()
@@ -43,7 +50,9 @@ def fetch_day(day: datetime.date):
         for r in raw
     ]
     candles.sort(key=lambda c: c.timestamp)
-    return candles
+    warmup = [c for c in candles if c.timestamp.date() < day]
+    day_candles = [c for c in candles if c.timestamp.date() == day]
+    return warmup, day_candles
 
 
 def save_csv(candles, path):
@@ -54,10 +63,17 @@ def save_csv(candles, path):
             w.writerow([c.timestamp.isoformat(), c.open, c.high, c.low, c.close])
 
 
-def replay(candles):
+def replay(candles, warmup=()):
     """Run the strategy over the day with the live bot's session rules:
-    no new entries at/after NO_ENTRY_AFTER, square-off at SQUARE_OFF."""
+    warm up silently on prior days' candles, then trade the target day
+    with no new entries at/after NO_ENTRY_AFTER and square-off at
+    SQUARE_OFF."""
     strategy = SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
+    for c in warmup:
+        strategy.on_closed_candle(c)
+    if strategy.state != "IDLE":
+        strategy.force_exit(price=None)  # discard any phantom warm-up position
+
     trades, open_trade = [], None
 
     for candle in candles:
@@ -118,12 +134,12 @@ def report(day, trades):
 
 if __name__ == "__main__":
     day = datetime.strptime(sys.argv[1], "%Y-%m-%d").date() if len(sys.argv) > 1 else datetime.now().date()
-    candles = fetch_day(day)
+    warmup, candles = fetch_day(day)
     if not candles:
         print(f"No candle data returned for {day} (holiday/weekend?)")
         sys.exit(1)
     csv_path = f"nifty_{day:%Y%m%d}_3m.csv"
-    save_csv(candles, csv_path)
-    print(f"Fetched {len(candles)} candles -> saved to {csv_path}")
-    trades = replay(candles)
+    save_csv(warmup + candles, csv_path)
+    print(f"Fetched {len(candles)} candles for {day} (+{len(warmup)} warm-up) -> saved to {csv_path}")
+    trades = replay(candles, warmup=warmup)
     report(day, trades)
