@@ -14,15 +14,17 @@ described below using Angel One's official **SmartAPI**.
 Plain-English rule → precise implementation (`strategy.py`):
 
 The strategy runs on **3-minute candles** (`CANDLE_INTERVAL` in
-`config.py`) and trades **both directions** symmetrically:
+`config.py`) using an **SMMA** (smoothed moving average, TradingView's
+"SMMA 20 close") and trades **both directions** symmetrically:
 
 | Rule | LONG (buys ATM **CE**) | SHORT (buys ATM **PE**) |
 |---|---|---|
-| Setup | Two consecutive closed candles with `close > SMA(period)` → **ARMED**. Invalidated if price closes back below the SMA before triggering. | Two consecutive closed candles with `close < SMA(period)` → **ARMED**. Invalidated if price closes back above the SMA. |
+| Fresh cross | At least one candle must have closed **below** the SMMA since the last long setup — only genuine cross-up setups arm. | At least one candle must have closed **above** the SMMA since the last short setup. |
+| Setup | Two consecutive closed candles with `close > SMMA(period)` → **ARMED**. Invalidated if price closes back below the SMMA before triggering. | Two consecutive closed candles with `close < SMMA(period)` → **ARMED**. Invalidated if price closes back above the SMMA. |
 | Entry trigger | A later candle's `high` crosses the **high of the 2nd setup candle**. | A later candle's `low` crosses the **low of the 2nd setup candle**. |
 | Stop loss | **Low of the candle immediately before the entry candle.** | **High of the candle immediately before the entry candle.** |
 | Target | `entry + 2 × (entry − SL)` (1:2 RR on the underlying, configurable via `RISK_REWARD`). | `entry − 2 × (SL − entry)`. |
-| Early exit | Price touches the SMA twice while retracing **down** from the highest point made after entry. | Price touches the SMA twice while retracing **up** from the lowest point made after entry. |
+| Early exit | Price touches the SMMA twice while retracing **down** from the highest point made after entry. | Price touches the SMMA twice while retracing **up** from the lowest point made after entry. |
 
 Each distinct SMA touch is edge-detected — one continuous touch spanning
 several candles counts once, and the 2nd touch exits immediately.

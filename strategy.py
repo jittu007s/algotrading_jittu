@@ -5,19 +5,26 @@ and backtested (see backtest.py) without any network/broker access.
 
 Rules implemented, symmetrically for both directions (see README.md):
 
+  The moving average is an SMMA (smoothed moving average, a.k.a. RMA /
+  Wilder's MA) - the same line as TradingView's "SMMA 20 close" - not a
+  simple mean.
+
   LONG (buy ATM CE):
-    1. Two consecutive *closed* candles close above the SMA -> setup armed.
+    0. Fresh-cross filter: at least one candle must have CLOSED BELOW the
+       SMMA since the last long setup, so only genuine cross-up setups
+       arm - not every pair of closes in an ongoing uptrend.
+    1. Two consecutive *closed* candles close above the SMMA -> setup armed.
     2. Entry: a later candle's high crosses above the high of the 2nd
        (more recent) of those two candles.
     3. Stop loss: low of the candle immediately before the entry candle.
     4. Target: entry + risk_reward * (entry - stop_loss), on the underlying.
-    5. Early exit: price touches the SMA twice while retracing down from
+    5. Early exit: price touches the SMMA twice while retracing down from
        the highest point made after entry.
 
-  SHORT (buy ATM PE): the exact mirror — two closes below the SMA, entry
-  on a break below the 2nd candle's low, stop loss at the previous
-  candle's high, 1:2 target below, early exit on two SMA touches while
-  price rises from the lowest point made after entry.
+  SHORT (buy ATM PE): the exact mirror — a fresh cross-down, two closes
+  below the SMMA, entry on a break below the 2nd candle's low, stop loss
+  at the previous candle's high, 1:2 target below, early exit on two SMMA
+  touches while price rises from the lowest point made after entry.
 """
 
 from collections import deque
@@ -73,7 +80,14 @@ class SmaCrossOptionStrategy:
         history_len = max(200, sma_period + 5)
         self._candles = deque(maxlen=history_len)
         self._sma_history = deque(maxlen=history_len)
-        self._closes = deque(maxlen=sma_period)
+        self._seed_closes = []   # first `sma_period` closes seed the SMMA
+        self._smma = None
+
+        # Fresh-cross tracking: a long setup needs a close below the SMMA
+        # since the last long arm (mirror for shorts), so we only trade
+        # genuine crossovers, not every candle pair inside a trend.
+        self._seen_close_below = False
+        self._seen_close_above = False
 
         self.state = "IDLE"       # IDLE -> ARMED -> IN_POSITION
         self.direction = None      # "LONG" or "SHORT" while ARMED / IN_POSITION
@@ -87,17 +101,30 @@ class SmaCrossOptionStrategy:
         self._currently_touching_sma = False
 
     # ------------------------------------------------------------------
-    def _sma(self):
-        if len(self._closes) < self.sma_period:
-            return None
-        return sum(self._closes) / self.sma_period
+    def _update_smma(self, close):
+        """SMMA / RMA: seeded with the simple mean of the first `period`
+        closes, then smma = (prev * (period - 1) + close) / period."""
+        if self._smma is None:
+            self._seed_closes.append(close)
+            if len(self._seed_closes) >= self.sma_period:
+                self._smma = sum(self._seed_closes) / self.sma_period
+        else:
+            self._smma = (self._smma * (self.sma_period - 1) + close) / self.sma_period
+        return self._smma
 
     # ------------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
-        self._closes.append(candle.close)
-        sma = self._sma()
+        sma = self._update_smma(candle.close)
         self._candles.append(candle)
         self._sma_history.append(sma)
+
+        # Track which side of the SMMA closes land on, in every state, so a
+        # cross that happens mid-trade still validates the next setup.
+        if sma is not None:
+            if candle.close < sma:
+                self._seen_close_below = True
+            elif candle.close > sma:
+                self._seen_close_above = True
 
         if self.state == "IN_POSITION":
             return self._process_in_position(candle, sma)
@@ -114,14 +141,18 @@ class SmaCrossOptionStrategy:
         if prev_sma is None:
             return StrategyEvent(Signal.NONE, candle.close)
 
-        if prev_candle.close > prev_sma and candle.close > sma:
+        if (prev_candle.close > prev_sma and candle.close > sma
+                and self._seen_close_below):
             self.state = "ARMED"
             self.direction = "LONG"
             self.trigger_level = candle.high  # high of the 2nd (latest) candle
-        elif prev_candle.close < prev_sma and candle.close < sma:
+            self._seen_close_below = False    # consume the cross
+        elif (prev_candle.close < prev_sma and candle.close < sma
+                and self._seen_close_above):
             self.state = "ARMED"
             self.direction = "SHORT"
             self.trigger_level = candle.low   # low of the 2nd (latest) candle
+            self._seen_close_above = False
 
         return StrategyEvent(Signal.NONE, candle.close)
 

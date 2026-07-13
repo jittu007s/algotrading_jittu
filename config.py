@@ -27,7 +27,7 @@ LOT_SIZE = 75
 # Angel One candle interval enum: ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE,
 # TEN_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY
 CANDLE_INTERVAL = "THREE_MINUTE"
-SMA_PERIOD = 20
+SMA_PERIOD = 20   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close")
 RISK_REWARD = 2.0
 
 # --- Execution / safety --------------------------------------------------
