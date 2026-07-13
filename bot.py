@@ -1,8 +1,8 @@
 """Live trading loop.
 
 Polls closed candles for the Nifty 50 index, feeds them into
-SmaCrossOptionStrategy, and executes ATM CE entries/exits on Angel One via
-SmartAPI when a signal fires.
+SmaCrossOptionStrategy, and executes ATM option entries/exits (CE for long
+signals, PE for short signals) on Angel One via SmartAPI when a signal fires.
 
 Run with DRY_RUN=true (the default - see config.py / .env) to log signals
 without sending real orders while you validate behaviour against the live
@@ -48,15 +48,15 @@ def is_past_square_off(now):
     return (now.hour, now.minute) >= (h, m)
 
 
-def enter_position(client, scrip_master, spot_price, event):
+def enter_position(client, scrip_master, spot_price, event, option_type):
     option = find_atm_option(
-        scrip_master, spot_price, option_type="CE",
+        scrip_master, spot_price, option_type=option_type,
         underlying=config.UNDERLYING_NAME, strike_step=config.STRIKE_STEP,
     )
     qty = option["lotsize"] or config.LOT_SIZE
     logger.info(
-        "ENTRY signal @ spot=%.2f -> BUY %s qty=%s | SL(underlying)=%.2f target(underlying)=%.2f",
-        spot_price, option["symbol"], qty, event.stop_loss, event.target,
+        "ENTRY signal (%s) @ spot=%.2f -> BUY %s qty=%s | SL(underlying)=%.2f target(underlying)=%.2f",
+        option_type, spot_price, option["symbol"], qty, event.stop_loss, event.target,
     )
 
     if not config.DRY_RUN:
@@ -96,8 +96,6 @@ def main():
 
     strategy = SmaCrossOptionStrategy(
         sma_period=config.SMA_PERIOD,
-        swing_fractal=config.SWING_FRACTAL,
-        swing_lookback=config.SWING_LOOKBACK,
         risk_reward=config.RISK_REWARD,
     )
 
@@ -119,8 +117,9 @@ def main():
                 last_seen_ts = candle.timestamp
                 event = strategy.on_closed_candle(candle)
 
-                if event.signal == Signal.ENTER_LONG_CE and not held_option:
-                    held_option = enter_position(client, scrip_master, candle.close, event)
+                if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) and not held_option:
+                    option_type = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
+                    held_option = enter_position(client, scrip_master, candle.close, event, option_type)
                 elif event.signal == Signal.EXIT and held_option:
                     exit_position(client, held_option, event)
                     held_option = None

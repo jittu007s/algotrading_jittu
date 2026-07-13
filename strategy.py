@@ -3,18 +3,21 @@
 Kept independent of the Angel One SmartAPI client so it can be unit tested
 and backtested (see backtest.py) without any network/broker access.
 
-Rules implemented (see README.md for the full spec and the assumptions
-made to turn the English description into precise logic):
+Rules implemented, symmetrically for both directions (see README.md):
 
-  1. Two consecutive *closed* candles close above the SMA -> setup "armed".
-  2. Entry trigger: a later candle's high crosses above the high of the
-     2nd (more recent) of those two candles -> BUY 1 lot ATM CE.
-  3. Stop loss: most recent confirmed swing low (fractal low) before entry.
-  4. Target: 1:2 risk/reward measured on the underlying, off the entry
-     price and stop loss.
-  5. Early exit: price touches the SMA twice while retracing from the
-     highest point made after entry ("touch back SMA twice while falling
-     from top").
+  LONG (buy ATM CE):
+    1. Two consecutive *closed* candles close above the SMA -> setup armed.
+    2. Entry: a later candle's high crosses above the high of the 2nd
+       (more recent) of those two candles.
+    3. Stop loss: low of the candle immediately before the entry candle.
+    4. Target: entry + risk_reward * (entry - stop_loss), on the underlying.
+    5. Early exit: price touches the SMA twice while retracing down from
+       the highest point made after entry.
+
+  SHORT (buy ATM PE): the exact mirror — two closes below the SMA, entry
+  on a break below the 2nd candle's low, stop loss at the previous
+  candle's high, 1:2 target below, early exit on two SMA touches while
+  price rises from the lowest point made after entry.
 """
 
 from collections import deque
@@ -37,6 +40,7 @@ class Candle:
 class Signal(Enum):
     NONE = auto()
     ENTER_LONG_CE = auto()
+    ENTER_SHORT_PE = auto()
     EXIT = auto()
 
 
@@ -62,26 +66,23 @@ class StrategyEvent:
 
 
 class SmaCrossOptionStrategy:
-    def __init__(self, sma_period: int = 20, swing_fractal: int = 2, swing_lookback: int = 30,
-                 risk_reward: float = 2.0):
+    def __init__(self, sma_period: int = 20, risk_reward: float = 2.0):
         self.sma_period = sma_period
-        self.swing_fractal = swing_fractal
-        self.swing_lookback = swing_lookback
         self.risk_reward = risk_reward
 
-        history_len = max(200, swing_lookback + swing_fractal * 2 + 5)
+        history_len = max(200, sma_period + 5)
         self._candles = deque(maxlen=history_len)
         self._sma_history = deque(maxlen=history_len)
         self._closes = deque(maxlen=sma_period)
 
-        self.state = "IDLE"  # IDLE -> ARMED -> IN_POSITION
-        self.trigger_high = None
-        self._pending_sl = None
+        self.state = "IDLE"       # IDLE -> ARMED -> IN_POSITION
+        self.direction = None      # "LONG" or "SHORT" while ARMED / IN_POSITION
+        self.trigger_level = None  # high (long) / low (short) of the 2nd setup candle
 
         self.entry_price = None
         self.stop_loss = None
         self.target = None
-        self.peak_since_entry = None
+        self.extreme_since_entry = None  # highest high (long) / lowest low (short)
         self.sma_touch_count = 0
         self._currently_touching_sma = False
 
@@ -90,17 +91,6 @@ class SmaCrossOptionStrategy:
         if len(self._closes) < self.sma_period:
             return None
         return sum(self._closes) / self.sma_period
-
-    def _find_swing_low(self):
-        """Most recent confirmed fractal low: a candle whose low is the
-        lowest among `swing_fractal` candles on either side of it."""
-        candles = list(self._candles)[-self.swing_lookback:]
-        n = self.swing_fractal
-        for i in range(len(candles) - n - 1, n - 1, -1):
-            window = candles[i - n:i + n + 1]
-            if candles[i].low == min(c.low for c in window):
-                return candles[i].low
-        return min((c.low for c in candles), default=None)
 
     # ------------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
@@ -126,56 +116,91 @@ class SmaCrossOptionStrategy:
 
         if prev_candle.close > prev_sma and candle.close > sma:
             self.state = "ARMED"
-            self.trigger_high = candle.high  # high of the 2nd (latest) candle
-            self._pending_sl = self._find_swing_low()
+            self.direction = "LONG"
+            self.trigger_level = candle.high  # high of the 2nd (latest) candle
+        elif prev_candle.close < prev_sma and candle.close < sma:
+            self.state = "ARMED"
+            self.direction = "SHORT"
+            self.trigger_level = candle.low   # low of the 2nd (latest) candle
 
         return StrategyEvent(Signal.NONE, candle.close)
 
     def _process_armed(self, candle, sma):
-        # Setup invalidated if price closes back below the SMA before triggering.
-        if sma is not None and candle.close < sma:
-            self.state = "IDLE"
-            self.trigger_high = None
-            self._pending_sl = None
+        # Setup invalidated if price closes back across the SMA before triggering.
+        crossed_back = (
+            sma is not None
+            and ((self.direction == "LONG" and candle.close < sma)
+                 or (self.direction == "SHORT" and candle.close > sma))
+        )
+        if crossed_back:
+            self._reset()
+            # The invalidating candle may itself start an opposite setup.
+            return self._process_idle(candle, sma)
+
+        triggered = (
+            (self.direction == "LONG" and candle.high >= self.trigger_level)
+            or (self.direction == "SHORT" and candle.low <= self.trigger_level)
+        )
+        if not triggered:
             return StrategyEvent(Signal.NONE, candle.close)
 
-        if candle.high >= self.trigger_high:
-            entry_price = self.trigger_high
-            sl = self._pending_sl if self._pending_sl is not None else candle.low
+        entry_price = self.trigger_level
+        prev_candle = self._candles[-2]  # candle immediately before the entry candle
+
+        if self.direction == "LONG":
+            sl = prev_candle.low
             risk = entry_price - sl
             if risk <= 0:
-                risk = entry_price * 0.01  # degenerate fallback, shouldn't normally happen
+                risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
                 sl = entry_price - risk
             target = entry_price + self.risk_reward * risk
+            signal = Signal.ENTER_LONG_CE
+            self.extreme_since_entry = candle.high
+        else:
+            sl = prev_candle.high
+            risk = sl - entry_price
+            if risk <= 0:
+                risk = entry_price * 0.005
+                sl = entry_price + risk
+            target = entry_price - self.risk_reward * risk
+            signal = Signal.ENTER_SHORT_PE
+            self.extreme_since_entry = candle.low
 
-            self.state = "IN_POSITION"
-            self.entry_price = entry_price
-            self.stop_loss = sl
-            self.target = target
-            self.peak_since_entry = candle.high
-            self.sma_touch_count = 0
-            self._currently_touching_sma = False
+        self.state = "IN_POSITION"
+        self.entry_price = entry_price
+        self.stop_loss = sl
+        self.target = target
+        self.sma_touch_count = 0
+        self._currently_touching_sma = False
 
-            return StrategyEvent(Signal.ENTER_LONG_CE, entry_price, stop_loss=sl, target=target)
-
-        return StrategyEvent(Signal.NONE, candle.close)
+        return StrategyEvent(signal, entry_price, stop_loss=sl, target=target)
 
     def _process_in_position(self, candle, sma):
-        if candle.low <= self.stop_loss:
+        if self.direction == "LONG":
+            hit_sl = candle.low <= self.stop_loss
+            hit_target = candle.high >= self.target
+            made_new_extreme = candle.high > self.extreme_since_entry
+            new_extreme = max(self.extreme_since_entry, candle.high)
+        else:
+            hit_sl = candle.high >= self.stop_loss
+            hit_target = candle.low <= self.target
+            made_new_extreme = candle.low < self.extreme_since_entry
+            new_extreme = min(self.extreme_since_entry, candle.low)
+
+        if hit_sl:
             exit_price = self.stop_loss
             self._reset()
             return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.STOP_LOSS)
 
-        if candle.high >= self.target:
+        if hit_target:
             exit_price = self.target
             self._reset()
             return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.TARGET)
 
-        made_new_peak = candle.high > self.peak_since_entry
-        self.peak_since_entry = max(self.peak_since_entry, candle.high)
+        self.extreme_since_entry = new_extreme
 
         touching = sma is not None and candle.low <= sma <= candle.high
-        if not made_new_peak and touching and not self._currently_touching_sma:
+        if not made_new_extreme and touching and not self._currently_touching_sma:
             self.sma_touch_count += 1
             self._currently_touching_sma = True
             if self.sma_touch_count >= 2:
@@ -194,11 +219,11 @@ class SmaCrossOptionStrategy:
 
     def _reset(self):
         self.state = "IDLE"
-        self.trigger_high = None
-        self._pending_sl = None
+        self.direction = None
+        self.trigger_level = None
         self.entry_price = None
         self.stop_loss = None
         self.target = None
-        self.peak_since_entry = None
+        self.extreme_since_entry = None
         self.sma_touch_count = 0
         self._currently_touching_sma = False

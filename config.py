@@ -24,12 +24,10 @@ STRIKE_STEP = 50
 LOT_SIZE = 75
 
 # --- Strategy parameters -----------------------------------------------
-# Angel One candle interval enum: ONE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE,
-# THIRTY_MINUTE, ONE_HOUR, ONE_DAY, ...
-CANDLE_INTERVAL = "FIFTEEN_MINUTE"
+# Angel One candle interval enum: ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE,
+# TEN_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY
+CANDLE_INTERVAL = "THREE_MINUTE"
 SMA_PERIOD = 20
-SWING_FRACTAL = 2       # candles on each side used to confirm a swing low
-SWING_LOOKBACK = 30     # how far back to search for the swing low
 RISK_REWARD = 2.0
 
 # --- Execution / safety --------------------------------------------------

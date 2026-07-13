@@ -42,8 +42,9 @@ def run_backtest(candles, **strategy_kwargs):
 
     for candle in candles:
         event = strategy.on_closed_candle(candle)
-        if event.signal == Signal.ENTER_LONG_CE:
+        if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE):
             open_trade = {
+                "side": "LONG" if event.signal == Signal.ENTER_LONG_CE else "SHORT",
                 "entry_time": candle.timestamp,
                 "entry_price": event.price,
                 "stop_loss": event.stop_loss,
@@ -53,7 +54,8 @@ def run_backtest(candles, **strategy_kwargs):
             open_trade["exit_time"] = candle.timestamp
             open_trade["exit_price"] = event.price
             open_trade["reason"] = event.reason.value if event.reason else None
-            open_trade["points"] = event.price - open_trade["entry_price"]
+            move = event.price - open_trade["entry_price"]
+            open_trade["points"] = move if open_trade["side"] == "LONG" else -move
             trades.append(open_trade)
             open_trade = None
 
@@ -75,7 +77,7 @@ def summarize(trades):
           f"Avg points/trade: {total_points / len(trades):.2f}\n")
 
     for t in trades:
-        print(f"  {t['entry_time']} -> {t.get('exit_time')} | "
+        print(f"  {t['side']:<5} {t['entry_time']} -> {t.get('exit_time')} | "
               f"entry={t['entry_price']:.2f} exit={t.get('exit_price'):.2f} "
               f"reason={t.get('reason')} points={t['points']:.2f}")
 

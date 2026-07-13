@@ -13,13 +13,19 @@ described below using Angel One's official **SmartAPI**.
 
 Plain-English rule → precise implementation (`strategy.py`):
 
-| Rule (as given) | Implementation |
-|---|---|
-| "Two consecutive candles close above SMA" | On each closed candle, both it and the prior candle must have `close > SMA(period)` computed at their own bar → setup becomes **ARMED**. If price closes back below the SMA before triggering, the setup is invalidated. |
-| "Buy 1 lot ATM option when price crosses the second candle's high" | While ARMED, the **high of the more recent of the two candles** is the trigger level. The next candle whose `high >= trigger` fires **entry**: BUY 1 lot of the at-the-money (ATM) Nifty **CE** (the pattern is bullish, so a call option is bought). |
-| "Stop loss to previous swing low" | The most recent confirmed fractal swing low (a candle whose low is lower than `swing_fractal` candles on either side, default 2) found within `swing_lookback` candles before the trigger. |
-| "Exit at 1:2 RR" | `target = entry + 2 * (entry - stop_loss)`, computed on the **underlying** (Nifty index), risk/reward configurable via `RISK_REWARD`. |
-| "Exit when price touches back SMA twice while falling from top" | After entry, the bot tracks the highest high made since entry (`peak`). Once a candle no longer extends that peak, each distinct time price range touches the SMA line counts as one "touch" (edge-detected, so one continuous touch = one count, not one per candle). On the 2nd such touch, exit immediately. |
+The strategy runs on **3-minute candles** (`CANDLE_INTERVAL` in
+`config.py`) and trades **both directions** symmetrically:
+
+| Rule | LONG (buys ATM **CE**) | SHORT (buys ATM **PE**) |
+|---|---|---|
+| Setup | Two consecutive closed candles with `close > SMA(period)` → **ARMED**. Invalidated if price closes back below the SMA before triggering. | Two consecutive closed candles with `close < SMA(period)` → **ARMED**. Invalidated if price closes back above the SMA. |
+| Entry trigger | A later candle's `high` crosses the **high of the 2nd setup candle**. | A later candle's `low` crosses the **low of the 2nd setup candle**. |
+| Stop loss | **Low of the candle immediately before the entry candle.** | **High of the candle immediately before the entry candle.** |
+| Target | `entry + 2 × (entry − SL)` (1:2 RR on the underlying, configurable via `RISK_REWARD`). | `entry − 2 × (SL − entry)`. |
+| Early exit | Price touches the SMA twice while retracing **down** from the highest point made after entry. | Price touches the SMA twice while retracing **up** from the lowest point made after entry. |
+
+Each distinct SMA touch is edge-detected — one continuous touch spanning
+several candles counts once, and the 2nd touch exits immediately.
 
 Notes / assumptions worth double-checking against your own intent before
 going live:
@@ -28,9 +34,8 @@ going live:
   the standard way to run "trade the index, execute via options"
   strategies. The option position is simply squared off when the
   underlying condition fires.
-- Only the bullish (CE) side is implemented, matching the rule as
-  described. A symmetric bearish/PE version would mirror the same logic
-  (candles below SMA, trigger on low crossing below, swing high for SL).
+- Both legs only ever **buy** options (CE for longs, PE for shorts), so
+  the maximum loss per trade is capped at the premium paid.
 - Only one open position at a time — no pyramiding/re-entry while already
   in a trade.
 - Any open position is force-flattened by `SQUARE_OFF_HOUR_MINUTE`
