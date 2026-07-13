@@ -42,4 +42,10 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 # state, so an intraday option position never gets carried overnight.
 SQUARE_OFF_HOUR_MINUTE = (15, 20)
 
-POLL_SECONDS = 15
+# How long after a candle boundary to wait before fetching it (gives Angel
+# One's servers time to finalize the bar). One data request per candle.
+FETCH_DELAY_SECONDS = 8
+
+# Cool-down after an AB1021 "Too many requests" response. Angel One's
+# historical endpoint has a strict quota; back off generously.
+RATE_LIMIT_COOLDOWN_SECONDS = 60

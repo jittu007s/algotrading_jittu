@@ -22,23 +22,49 @@ from strategy import Candle, Signal, SmaCrossOptionStrategy
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("bot")
 
+INTERVAL_SECONDS = {
+    "ONE_MINUTE": 60,
+    "THREE_MINUTE": 180,
+    "FIVE_MINUTE": 300,
+    "TEN_MINUTE": 600,
+    "FIFTEEN_MINUTE": 900,
+    "THIRTY_MINUTE": 1800,
+    "ONE_HOUR": 3600,
+}
+
+
+def seconds_until_next_candle(now):
+    """Sleep until just after the next candle boundary closes, so we make
+    ONE data request per candle instead of hammering the rate-limited
+    historical API every few seconds."""
+    interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
+    epoch = now.timestamp()
+    next_close = (int(epoch // interval_s) + 1) * interval_s
+    return max(next_close + config.FETCH_DELAY_SECONDS - epoch, 1.0)
+
 
 def fetch_new_candles(client, last_seen_ts):
-    to_dt = datetime.now()
-    from_dt = to_dt - timedelta(days=2)
+    now = datetime.now()
+    from_dt = now - timedelta(days=4)  # covers weekends/holidays for SMA warm-up
     raw = client.get_candles(
         exchange=config.UNDERLYING_EXCHANGE,
         symboltoken=config.UNDERLYING_TOKEN,
         interval=config.CANDLE_INTERVAL,
         from_dt=from_dt,
-        to_dt=to_dt,
+        to_dt=now,
     )
+    interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
     candles = []
     for row in raw:
         ts = datetime.fromisoformat(row[0])
-        if last_seen_ts and ts <= last_seen_ts:
+        naive_ts = ts.replace(tzinfo=None)
+        if last_seen_ts and naive_ts <= last_seen_ts:
             continue
-        candles.append(Candle(timestamp=ts, open=row[1], high=row[2], low=row[3], close=row[4]))
+        # Skip the still-forming candle: only act on candles whose window
+        # has fully elapsed, otherwise signals fire on incomplete data.
+        if naive_ts + timedelta(seconds=interval_s) > now:
+            continue
+        candles.append(Candle(timestamp=naive_ts, open=row[1], high=row[2], low=row[3], close=row[4]))
     candles.sort(key=lambda c: c.timestamp)
     return candles
 
@@ -124,10 +150,15 @@ def main():
                     exit_position(client, held_option, event)
                     held_option = None
 
-        except Exception:
-            logger.exception("Error in main loop; will retry after poll interval")
+            time.sleep(seconds_until_next_candle(datetime.now()))
 
-        time.sleep(config.POLL_SECONDS)
+        except Exception as exc:
+            if "rate" in str(exc).lower() or "AB1021" in str(exc) or "Too many requests" in str(exc):
+                logger.warning("Rate limited by Angel One; cooling down %ss", config.RATE_LIMIT_COOLDOWN_SECONDS)
+                time.sleep(config.RATE_LIMIT_COOLDOWN_SECONDS)
+            else:
+                logger.exception("Error in main loop; retrying next candle")
+                time.sleep(seconds_until_next_candle(datetime.now()))
 
 
 if __name__ == "__main__":

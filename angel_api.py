@@ -57,7 +57,13 @@ class AngelBrokingClient:
                 last_err = resp
             except Exception as exc:  # network / rate-limit hiccups
                 last_err = exc
-            time.sleep(1.5 * (attempt + 1))
+            # Rate-limit responses (AB1021 / "exceeding access rate") need a
+            # long back-off - fast retries just extend the ban window.
+            err_text = str(last_err)
+            if "rate" in err_text.lower() or "AB1021" in err_text or "Too many requests" in err_text:
+                time.sleep(15.0 * (attempt + 1))
+            else:
+                time.sleep(2.0 * (attempt + 1))
         raise RuntimeError(f"getCandleData failed after {retries} attempts: {last_err}")
 
     def place_market_order(self, exchange: str, tradingsymbol: str, symboltoken: str,
