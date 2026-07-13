@@ -23,8 +23,8 @@ The strategy runs on **3-minute candles** (`CANDLE_INTERVAL` in
 | Setup | Two consecutive closed candles with `close > SMMA(period)` → **ARMED**. Invalidated if price closes back below the SMMA before triggering. | Two consecutive closed candles with `close < SMMA(period)` → **ARMED**. Invalidated if price closes back above the SMMA. |
 | Entry trigger | A later candle's `high` crosses the **high of the 2nd setup candle**. | A later candle's `low` crosses the **low of the 2nd setup candle**. |
 | Stop loss | **Low of the candle immediately before the entry candle.** | **High of the candle immediately before the entry candle.** |
-| Target | `entry + 2 × (entry − SL)` (1:2 RR on the underlying, configurable via `RISK_REWARD`). | `entry − 2 × (SL − entry)`. |
-| Early exit | Price touches the SMMA twice while retracing **down** from the highest point made after entry. | Price touches the SMMA twice while retracing **up** from the lowest point made after entry. |
+| 1:2 level | `entry + 2 × (entry − SL)` (configurable via `RISK_REWARD`). Reaching it does **not** close the trade — it activates trailing: the stop locks at least `entry + 1R` and then ratchets **up** along the SMMA every closed candle. Exit when price trades back to the trailed stop. | `entry − 2 × (SL − entry)`; on reaching it the stop locks at least `entry − 1R` and trails the SMMA **down**. |
+| Early exit | *(only before the 1:2 level is reached)* Price touches the SMMA twice while retracing **down** from the highest point made after entry. | Price touches the SMMA twice while retracing **up** from the lowest point made after entry. |
 
 Each distinct SMA touch is edge-detected — one continuous touch spanning
 several candles counts once, and the 2nd touch exits immediately.

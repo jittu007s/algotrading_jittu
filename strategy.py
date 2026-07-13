@@ -17,14 +17,19 @@ Rules implemented, symmetrically for both directions (see README.md):
     2. Entry: a later candle's high crosses above the high of the 2nd
        (more recent) of those two candles.
     3. Stop loss: low of the candle immediately before the entry candle.
-    4. Target: entry + risk_reward * (entry - stop_loss), on the underlying.
-    5. Early exit: price touches the SMMA twice while retracing down from
-       the highest point made after entry.
+    4. Target level: entry + risk_reward * (entry - stop_loss). Reaching
+       it does NOT close the trade - it switches to TRAILING mode: the
+       stop jumps to lock at least +1R (entry + risk) and from then on
+       ratchets up along the SMMA each closed candle, never loosening.
+       The trade exits when price trades back to the trailed stop.
+    5. Early exit (only while the target has not yet been reached): price
+       touches the SMMA twice while retracing down from the highest point
+       made after entry.
 
   SHORT (buy ATM PE): the exact mirror — a fresh cross-down, two closes
   below the SMMA, entry on a break below the 2nd candle's low, stop loss
-  at the previous candle's high, 1:2 target below, early exit on two SMMA
-  touches while price rises from the lowest point made after entry.
+  at the previous candle's high; on reaching the 1:2 level the stop locks
+  -1R below entry and trails the SMMA downward.
 """
 
 from collections import deque
@@ -53,23 +58,26 @@ class Signal(Enum):
 
 class ExitReason(Enum):
     STOP_LOSS = "stop_loss"
-    TARGET = "target"
+    TRAILING_STOP = "trailing_stop"
     SMA_DOUBLE_TOUCH = "sma_double_touch"
     FORCED_EOD = "forced_eod"
 
 
 class StrategyEvent:
     def __init__(self, signal: Signal, price: Optional[float], reason: Optional[ExitReason] = None,
-                 stop_loss: Optional[float] = None, target: Optional[float] = None):
+                 stop_loss: Optional[float] = None, target: Optional[float] = None,
+                 note: Optional[str] = None):
         self.signal = signal
         self.price = price
         self.reason = reason
         self.stop_loss = stop_loss
         self.target = target
+        self.note = note
 
     def __repr__(self):
         return (f"StrategyEvent(signal={self.signal}, price={self.price}, "
-                f"reason={self.reason}, stop_loss={self.stop_loss}, target={self.target})")
+                f"reason={self.reason}, stop_loss={self.stop_loss}, target={self.target}, "
+                f"note={self.note})")
 
 
 class SmaCrossOptionStrategy:
@@ -96,6 +104,8 @@ class SmaCrossOptionStrategy:
         self.entry_price = None
         self.stop_loss = None
         self.target = None
+        self.trailing = False   # True once the 1:2 level was reached
+        self._risk = None       # per-trade risk (|entry - initial SL|)
         self.extreme_since_entry = None  # highest high (long) / lowest low (short)
         self.sma_touch_count = 0
         self._currently_touching_sma = False
@@ -201,45 +211,61 @@ class SmaCrossOptionStrategy:
         self.entry_price = entry_price
         self.stop_loss = sl
         self.target = target
+        self.trailing = False
+        self._risk = risk
         self.sma_touch_count = 0
         self._currently_touching_sma = False
 
         return StrategyEvent(signal, entry_price, stop_loss=sl, target=target)
 
     def _process_in_position(self, candle, sma):
-        if self.direction == "LONG":
-            hit_sl = candle.low <= self.stop_loss
-            hit_target = candle.high >= self.target
-            made_new_extreme = candle.high > self.extreme_since_entry
-            new_extreme = max(self.extreme_since_entry, candle.high)
-        else:
-            hit_sl = candle.high >= self.stop_loss
-            hit_target = candle.low <= self.target
-            made_new_extreme = candle.low < self.extreme_since_entry
-            new_extreme = min(self.extreme_since_entry, candle.low)
+        long = self.direction == "LONG"
 
+        # 1. Stop check against the stop as it stood BEFORE this candle.
+        hit_sl = candle.low <= self.stop_loss if long else candle.high >= self.stop_loss
         if hit_sl:
             exit_price = self.stop_loss
+            reason = ExitReason.TRAILING_STOP if self.trailing else ExitReason.STOP_LOSS
             self._reset()
-            return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.STOP_LOSS)
+            return StrategyEvent(Signal.EXIT, exit_price, reason=reason)
 
-        if hit_target:
-            exit_price = self.target
-            self._reset()
-            return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.TARGET)
+        made_new_extreme = (candle.high > self.extreme_since_entry) if long \
+            else (candle.low < self.extreme_since_entry)
+        self.extreme_since_entry = max(self.extreme_since_entry, candle.high) if long \
+            else min(self.extreme_since_entry, candle.low)
 
-        self.extreme_since_entry = new_extreme
+        # 2. Reaching the 1:2 level switches to trailing instead of exiting:
+        #    lock at least +/-1R, then ratchet the stop along the SMMA.
+        if not self.trailing:
+            hit_target = candle.high >= self.target if long else candle.low <= self.target
+            if hit_target:
+                self.trailing = True
+                if long:
+                    lock = self.entry_price + self._risk
+                    self.stop_loss = max(self.stop_loss, lock, sma if sma is not None else lock)
+                else:
+                    lock = self.entry_price - self._risk
+                    self.stop_loss = min(self.stop_loss, lock, sma if sma is not None else lock)
+                self.target = None
+                return StrategyEvent(Signal.NONE, candle.close,
+                                     stop_loss=self.stop_loss, note="trailing_activated")
+        else:
+            if sma is not None:
+                self.stop_loss = max(self.stop_loss, sma) if long else min(self.stop_loss, sma)
 
-        touching = sma is not None and candle.low <= sma <= candle.high
-        if not made_new_extreme and touching and not self._currently_touching_sma:
-            self.sma_touch_count += 1
-            self._currently_touching_sma = True
-            if self.sma_touch_count >= 2:
-                exit_price = candle.close
-                self._reset()
-                return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
-        elif not touching:
-            self._currently_touching_sma = False
+        # 3. Double-SMMA-touch early exit applies only before the trade
+        #    earns trailing mode (afterwards the trailed stop handles exits).
+        if not self.trailing:
+            touching = sma is not None and candle.low <= sma <= candle.high
+            if not made_new_extreme and touching and not self._currently_touching_sma:
+                self.sma_touch_count += 1
+                self._currently_touching_sma = True
+                if self.sma_touch_count >= 2:
+                    exit_price = candle.close
+                    self._reset()
+                    return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
+            elif not touching:
+                self._currently_touching_sma = False
 
         return StrategyEvent(Signal.NONE, candle.close)
 
@@ -255,6 +281,8 @@ class SmaCrossOptionStrategy:
         self.entry_price = None
         self.stop_loss = None
         self.target = None
+        self.trailing = False
+        self._risk = None
         self.extreme_since_entry = None
         self.sma_touch_count = 0
         self._currently_touching_sma = False

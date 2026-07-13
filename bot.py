@@ -169,6 +169,10 @@ def main():
 
                 event = strategy.on_closed_candle(candle)
 
+                if event.note == "trailing_activated":
+                    logger.info("1:2 level reached - trailing mode ON, SL(underlying) moved to %.2f",
+                                event.stop_loss)
+
                 if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) and not held_option:
                     option_type = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
                     held_option = enter_position(client, scrip_master, candle, event, option_type)
