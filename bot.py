@@ -74,6 +74,11 @@ def is_past_square_off(now):
     return (now.hour, now.minute) >= (h, m)
 
 
+def is_past_entry_cutoff(now):
+    h, m = config.NO_ENTRY_AFTER_HOUR_MINUTE
+    return (now.hour, now.minute) >= (h, m)
+
+
 def enter_position(client, scrip_master, candle, event, option_type):
     option = find_atm_option(
         scrip_master, candle.close, option_type=option_type,
@@ -174,8 +179,15 @@ def main():
                                 event.stop_loss)
 
                 if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) and not held_option:
-                    option_type = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
-                    held_option = enter_position(client, scrip_master, candle, event, option_type)
+                    if is_past_entry_cutoff(datetime.now()):
+                        # Too close to square-off for the trade to work -
+                        # discard the strategy's position state, take no order.
+                        strategy.force_exit(price=None)
+                        logger.info("Entry signal suppressed - past %02d:%02d no-entry cutoff",
+                                    *config.NO_ENTRY_AFTER_HOUR_MINUTE)
+                    else:
+                        option_type = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
+                        held_option = enter_position(client, scrip_master, candle, event, option_type)
                 elif event.signal == Signal.EXIT and held_option:
                     exit_position(client, held_option, event)
                     held_option = None

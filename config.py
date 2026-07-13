@@ -38,6 +38,10 @@ ORDER_VARIETY = "NORMAL"
 # Flip to false only after you've validated behaviour end-to-end.
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
+# No NEW positions at or after this time (IST) - a trade opened minutes
+# before square-off never gets room to work and just burns brokerage.
+NO_ENTRY_AFTER_HOUR_MINUTE = (15, 0)
+
 # Force-flatten any open position by this time (IST) regardless of strategy
 # state, so an intraday option position never gets carried overnight.
 SQUARE_OFF_HOUR_MINUTE = (15, 20)
