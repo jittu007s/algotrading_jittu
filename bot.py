@@ -74,15 +74,16 @@ def is_past_square_off(now):
     return (now.hour, now.minute) >= (h, m)
 
 
-def enter_position(client, scrip_master, spot_price, event, option_type):
+def enter_position(client, scrip_master, candle, event, option_type):
     option = find_atm_option(
-        scrip_master, spot_price, option_type=option_type,
+        scrip_master, candle.close, option_type=option_type,
         underlying=config.UNDERLYING_NAME, strike_step=config.STRIKE_STEP,
     )
     qty = option["lotsize"] or config.LOT_SIZE
     logger.info(
-        "ENTRY signal (%s) @ spot=%.2f -> BUY %s qty=%s | SL(underlying)=%.2f target(underlying)=%.2f",
-        option_type, spot_price, option["symbol"], qty, event.stop_loss, event.target,
+        "ENTRY signal (%s) candle=%s entry=%.2f spot=%.2f -> BUY %s qty=%s | SL=%.2f target=%.2f",
+        option_type, candle.timestamp, event.price, candle.close,
+        option["symbol"], qty, event.stop_loss, event.target,
     )
 
     if not config.DRY_RUN:
@@ -101,7 +102,9 @@ def enter_position(client, scrip_master, spot_price, event, option_type):
 
 def exit_position(client, held_option, event):
     reason = event.reason.value if event.reason else "unknown"
-    logger.info("EXIT signal (%s) -> SELL %s qty=%s", reason, held_option["symbol"], held_option["quantity"])
+    price = "n/a" if event.price is None else f"{event.price:.2f}"
+    logger.info("EXIT signal (%s) exit(underlying)=%s -> SELL %s qty=%s",
+                reason, price, held_option["symbol"], held_option["quantity"])
 
     if not config.DRY_RUN:
         client.place_market_order(
@@ -128,6 +131,13 @@ def main():
     held_option = None  # dict with symbol/token/quantity while a position is open
     last_seen_ts = None
 
+    # Candles that closed before the bot started are HISTORY: they warm up
+    # the strategy state (SMA, setups) but must NEVER place orders. Only
+    # candles that close after this moment are tradeable.
+    start_time = datetime.now()
+    interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
+    warmup_done = False
+
     logger.info("Bot started. DRY_RUN=%s, interval=%s, sma=%s", config.DRY_RUN, config.CANDLE_INTERVAL, config.SMA_PERIOD)
 
     while True:
@@ -141,11 +151,27 @@ def main():
 
             for candle in fetch_new_candles(client, last_seen_ts):
                 last_seen_ts = candle.timestamp
+
+                is_live = candle.timestamp + timedelta(seconds=interval_s) > start_time
+                if not is_live:
+                    strategy.on_closed_candle(candle)  # state only - no orders on history
+                    continue
+
+                if not warmup_done:
+                    warmup_done = True
+                    if strategy.state == "IN_POSITION":
+                        # A "position" opened during warm-up was never real -
+                        # discard it instead of selling something we don't hold.
+                        strategy.force_exit(price=None)
+                        logger.info("Discarded phantom warm-up position; starting flat")
+                    logger.info("Warm-up complete (%d candles); live from %s",
+                                len(strategy._candles), candle.timestamp)
+
                 event = strategy.on_closed_candle(candle)
 
                 if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) and not held_option:
                     option_type = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
-                    held_option = enter_position(client, scrip_master, candle.close, event, option_type)
+                    held_option = enter_position(client, scrip_master, candle, event, option_type)
                 elif event.signal == Signal.EXIT and held_option:
                     exit_position(client, held_option, event)
                     held_option = None
