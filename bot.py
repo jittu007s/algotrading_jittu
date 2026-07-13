@@ -30,6 +30,11 @@ def build_strategy():
         return RegimeAdaptiveStrategy()
     return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
 
+
+def active_interval():
+    """Each strategy runs on its own candle timeframe."""
+    return config.ORB_CANDLE_INTERVAL if config.STRATEGY == "ORB" else config.CANDLE_INTERVAL
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("bot")
 
@@ -48,7 +53,7 @@ def seconds_until_next_candle(now):
     """Sleep until just after the next candle boundary closes, so we make
     ONE data request per candle instead of hammering the rate-limited
     historical API every few seconds."""
-    interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
+    interval_s = INTERVAL_SECONDS[active_interval()]
     epoch = now.timestamp()
     next_close = (int(epoch // interval_s) + 1) * interval_s
     return max(next_close + config.FETCH_DELAY_SECONDS - epoch, 1.0)
@@ -60,11 +65,11 @@ def fetch_new_candles(client, last_seen_ts):
     raw = client.get_candles(
         exchange=config.UNDERLYING_EXCHANGE,
         symboltoken=config.UNDERLYING_TOKEN,
-        interval=config.CANDLE_INTERVAL,
+        interval=active_interval(),
         from_dt=from_dt,
         to_dt=now,
     )
-    interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
+    interval_s = INTERVAL_SECONDS[active_interval()]
     candles = []
     for row in raw:
         ts = datetime.fromisoformat(row[0])
@@ -148,11 +153,11 @@ def main():
     # the strategy state (SMA, setups) but must NEVER place orders. Only
     # candles that close after this moment are tradeable.
     start_time = datetime.now()
-    interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
+    interval_s = INTERVAL_SECONDS[active_interval()]
     warmup_done = False
 
     logger.info("Bot started. DRY_RUN=%s, strategy=%s, interval=%s, sma=%s",
-                config.DRY_RUN, config.STRATEGY, config.CANDLE_INTERVAL, config.SMA_PERIOD)
+                config.DRY_RUN, config.STRATEGY, active_interval(), config.SMA_PERIOD)
 
     while True:
         try:
@@ -178,8 +183,7 @@ def main():
                         # discard it instead of selling something we don't hold.
                         strategy.force_exit(price=None)
                         logger.info("Discarded phantom warm-up position; starting flat")
-                    logger.info("Warm-up complete (%d candles); live from %s",
-                                len(strategy._candles), candle.timestamp)
+                    logger.info("Warm-up complete; live from %s", candle.timestamp)
 
                 event = strategy.on_closed_candle(candle)
 

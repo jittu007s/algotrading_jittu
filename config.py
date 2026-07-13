@@ -35,6 +35,7 @@ RISK_REWARD = 2.0
 STRATEGY = "SMMA_CROSS"
 OR_MINUTES = 15            # ORB: opening range = first N minutes of the session
 ORB_MAX_RISK_POINTS = 60   # ORB: skip the trade if the range (= risk) is wider
+ORB_CANDLE_INTERVAL = "FIVE_MINUTE"  # ORB runs on 5-min candles (others use CANDLE_INTERVAL)
 
 # --- Execution / safety --------------------------------------------------
 PRODUCT_TYPE = "INTRADAY"

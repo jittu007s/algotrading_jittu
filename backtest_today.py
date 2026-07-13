@@ -29,28 +29,31 @@ from strategy import Candle, ExitReason, Signal, SmaCrossOptionStrategy, Opening
 NO_ENTRY_AFTER = dtime(*config.NO_ENTRY_AFTER_HOUR_MINUTE)
 SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
 
+# name -> (factory, candle interval it runs on)
 STRATEGIES = {
-    "SMMA_CROSS": lambda: SmaCrossOptionStrategy(
+    "SMMA_CROSS": (lambda: SmaCrossOptionStrategy(
         sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD),
-    "ORB": lambda: OpeningRangeBreakout(
+        config.CANDLE_INTERVAL),
+    "ORB": (lambda: OpeningRangeBreakout(
         sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD,
         or_minutes=config.OR_MINUTES, max_risk_points=config.ORB_MAX_RISK_POINTS),
-    "REGIME": lambda: RegimeAdaptiveStrategy(),
+        config.ORB_CANDLE_INTERVAL),
+    "REGIME": (lambda: RegimeAdaptiveStrategy(), config.CANDLE_INTERVAL),
 }
 
+_INTERVAL_LABEL = {"ONE_MINUTE": "1m", "THREE_MINUTE": "3m", "FIVE_MINUTE": "5m",
+                   "TEN_MINUTE": "10m", "FIFTEEN_MINUTE": "15m"}
 
-def fetch_history(calendar_days=21):
-    client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
-    client.login()
+
+def fetch_history(client, interval, calendar_days=21):
     now = datetime.now()
     raw = client.get_candles(
         exchange=config.UNDERLYING_EXCHANGE,
         symboltoken=config.UNDERLYING_TOKEN,
-        interval=config.CANDLE_INTERVAL,
+        interval=interval,
         from_dt=now - timedelta(days=calendar_days),
         to_dt=now,
     )
-    client.logout()
     candles = [
         Candle(timestamp=datetime.fromisoformat(r[0]).replace(tzinfo=None),
                open=r[1], high=r[2], low=r[3], close=r[4])
@@ -60,7 +63,8 @@ def fetch_history(calendar_days=21):
     return candles
 
 
-def save_csv(candles, path="nifty_3m_history.csv"):
+def save_csv(candles, interval):
+    path = f"nifty_{_INTERVAL_LABEL.get(interval, interval)}_history.csv"
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["timestamp", "open", "high", "low", "close"])
@@ -132,17 +136,25 @@ def main():
         else:
             n_days = int(arg)
 
-    candles = fetch_history()
-    save_csv(candles)
-    all_dates = sorted({c.timestamp.date() for c in candles})
+    client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
+    client.login()
+    data = {}
+    for interval in {iv for _f, iv in STRATEGIES.values()}:
+        data[interval] = fetch_history(client, interval)
+        save_csv(data[interval], interval)
+    client.logout()
+
+    base = data[config.CANDLE_INTERVAL]
+    all_dates = sorted({c.timestamp.date() for c in base})
     if target_dates is None:
         target_dates = all_dates[-n_days:]
-    print(f"Data: {len(candles)} candles across {len(all_dates)} sessions "
+    print(f"Data: {len(base)} base candles across {len(all_dates)} sessions "
           f"({all_dates[0]} .. {all_dates[-1]}); testing {len(target_dates)} session(s)\n")
 
     grand = {}
-    for name, factory in STRATEGIES.items():
-        print(f"================ {name} ================")
+    for name, (factory, interval) in STRATEGIES.items():
+        candles = data[interval]
+        print(f"================ {name} ({_INTERVAL_LABEL.get(interval, interval)} candles) ================")
         g_trades, g_wins, g_total = 0, 0, 0.0
         for day in target_dates:
             warmup = [c for c in candles if c.timestamp.date() < day]
