@@ -60,6 +60,7 @@ class ExitReason(Enum):
     STOP_LOSS = "stop_loss"
     TRAILING_STOP = "trailing_stop"
     SMA_DOUBLE_TOUCH = "sma_double_touch"
+    TIME_EXIT = "time_exit"
     FORCED_EOD = "forced_eod"
 
 
@@ -286,3 +287,158 @@ class SmaCrossOptionStrategy:
         self.extreme_since_entry = None
         self.sma_touch_count = 0
         self._currently_touching_sma = False
+
+
+class OpeningRangeBreakout:
+    """Opening Range Breakout (ORB) - one of the oldest and most widely
+    documented professional intraday strategies (Crabel 1990; validated on
+    modern data by Zarattini & Aziz 2023), adapted to this bot's framework:
+
+      - Opening range (OR) = the high/low of the first `or_minutes` of the
+        session (default 15 min = the first five 3-minute candles).
+      - LONG (buy ATM CE): a candle CLOSES above the OR high. Stop = OR low.
+      - SHORT (buy ATM PE): a candle CLOSES below the OR low. Stop = OR high.
+      - Risk guard: if the OR is wider than `max_risk_points`, the trade is
+        skipped - a stop further than that is not worth an ATM option.
+      - Management is identical to the SMMA strategy: at risk_reward x risk
+        the stop locks +/-1R and trails the SMMA; exits on the trailed stop.
+      - Discipline: at most ONE long and ONE short attempt per day - a core
+        part of why ORB survives costs. No re-entries after a stop-out.
+
+    Exposes the same interface/state fields as SmaCrossOptionStrategy so
+    bot.py and the backtesters can drive either interchangeably.
+    """
+
+    def __init__(self, sma_period: int = 20, risk_reward: float = 2.0,
+                 or_minutes: int = 15, max_risk_points: float = 60.0):
+        self.sma_period = sma_period
+        self.risk_reward = risk_reward
+        self.or_minutes = or_minutes
+        self.max_risk_points = max_risk_points
+
+        self._seed_closes = []
+        self._smma = None
+
+        self._session = None
+        self._or_high = None
+        self._or_low = None
+        self._traded_long = False
+        self._traded_short = False
+
+        self.state = "IDLE"
+        self.direction = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.target = None
+        self.trailing = False
+        self._risk = None
+        self.extreme_since_entry = None
+
+    def _update_smma(self, close):
+        if self._smma is None:
+            self._seed_closes.append(close)
+            if len(self._seed_closes) >= self.sma_period:
+                self._smma = sum(self._seed_closes) / self.sma_period
+        else:
+            self._smma = (self._smma * (self.sma_period - 1) + close) / self.sma_period
+        return self._smma
+
+    def on_closed_candle(self, candle: Candle) -> StrategyEvent:
+        sma = self._update_smma(candle.close)
+
+        day = candle.timestamp.date()
+        if day != self._session:
+            self._session = day
+            self._or_high = candle.high
+            self._or_low = candle.low
+            self._traded_long = False
+            self._traded_short = False
+            if self.state == "IN_POSITION":  # shouldn't happen (square-off), but be safe
+                self._reset()
+            return StrategyEvent(Signal.NONE, candle.close)
+
+        session_open = candle.timestamp.replace(hour=9, minute=15, second=0, microsecond=0)
+        in_or_window = (candle.timestamp - session_open).total_seconds() / 60 < self.or_minutes
+        if in_or_window:
+            self._or_high = max(self._or_high, candle.high)
+            self._or_low = min(self._or_low, candle.low)
+            return StrategyEvent(Signal.NONE, candle.close)
+
+        if self.state == "IN_POSITION":
+            return self._manage(candle, sma)
+
+        # --- entries: close through the opening range, one shot per side ---
+        or_range = self._or_high - self._or_low
+        if candle.close > self._or_high and not self._traded_long:
+            self._traded_long = True
+            if or_range <= self.max_risk_points:
+                return self._enter("LONG", candle.close, self._or_low, candle)
+        elif candle.close < self._or_low and not self._traded_short:
+            self._traded_short = True
+            if or_range <= self.max_risk_points:
+                return self._enter("SHORT", candle.close, self._or_high, candle)
+
+        return StrategyEvent(Signal.NONE, candle.close)
+
+    def _enter(self, direction, entry_price, sl, candle):
+        risk = abs(entry_price - sl)
+        if risk <= 0:
+            return StrategyEvent(Signal.NONE, candle.close)
+        self.state = "IN_POSITION"
+        self.direction = direction
+        self.entry_price = entry_price
+        self.stop_loss = sl
+        self._risk = risk
+        self.trailing = False
+        if direction == "LONG":
+            self.target = entry_price + self.risk_reward * risk
+            self.extreme_since_entry = candle.high
+            return StrategyEvent(Signal.ENTER_LONG_CE, entry_price, stop_loss=sl, target=self.target)
+        self.target = entry_price - self.risk_reward * risk
+        self.extreme_since_entry = candle.low
+        return StrategyEvent(Signal.ENTER_SHORT_PE, entry_price, stop_loss=sl, target=self.target)
+
+    def _manage(self, candle, sma):
+        long = self.direction == "LONG"
+
+        hit_sl = candle.low <= self.stop_loss if long else candle.high >= self.stop_loss
+        if hit_sl:
+            exit_price = self.stop_loss
+            reason = ExitReason.TRAILING_STOP if self.trailing else ExitReason.STOP_LOSS
+            self._reset()
+            return StrategyEvent(Signal.EXIT, exit_price, reason=reason)
+
+        self.extreme_since_entry = max(self.extreme_since_entry, candle.high) if long \
+            else min(self.extreme_since_entry, candle.low)
+
+        if not self.trailing:
+            hit_target = candle.high >= self.target if long else candle.low <= self.target
+            if hit_target:
+                self.trailing = True
+                if long:
+                    lock = self.entry_price + self._risk
+                    self.stop_loss = max(self.stop_loss, lock, sma if sma is not None else lock)
+                else:
+                    lock = self.entry_price - self._risk
+                    self.stop_loss = min(self.stop_loss, lock, sma if sma is not None else lock)
+                self.target = None
+                return StrategyEvent(Signal.NONE, candle.close,
+                                     stop_loss=self.stop_loss, note="trailing_activated")
+        elif sma is not None:
+            self.stop_loss = max(self.stop_loss, sma) if long else min(self.stop_loss, sma)
+
+        return StrategyEvent(Signal.NONE, candle.close)
+
+    def force_exit(self, price, reason: ExitReason = ExitReason.FORCED_EOD) -> StrategyEvent:
+        self._reset()
+        return StrategyEvent(Signal.EXIT, price, reason=reason)
+
+    def _reset(self):
+        self.state = "IDLE"
+        self.direction = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.target = None
+        self.trailing = False
+        self._risk = None
+        self.extreme_since_entry = None

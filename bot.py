@@ -17,7 +17,18 @@ from datetime import datetime, timedelta
 import config
 from angel_api import AngelBrokingClient
 from instruments import find_atm_option, load_scrip_master
-from strategy import Candle, Signal, SmaCrossOptionStrategy
+from quant_strategy import RegimeAdaptiveStrategy
+from strategy import Candle, OpeningRangeBreakout, Signal, SmaCrossOptionStrategy
+
+
+def build_strategy():
+    if config.STRATEGY == "ORB":
+        return OpeningRangeBreakout(
+            sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD,
+            or_minutes=config.OR_MINUTES, max_risk_points=config.ORB_MAX_RISK_POINTS)
+    if config.STRATEGY == "REGIME":
+        return RegimeAdaptiveStrategy()
+    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("bot")
@@ -128,10 +139,7 @@ def main():
 
     scrip_master = load_scrip_master()
 
-    strategy = SmaCrossOptionStrategy(
-        sma_period=config.SMA_PERIOD,
-        risk_reward=config.RISK_REWARD,
-    )
+    strategy = build_strategy()
 
     held_option = None  # dict with symbol/token/quantity while a position is open
     last_seen_ts = None
@@ -143,7 +151,8 @@ def main():
     interval_s = INTERVAL_SECONDS[config.CANDLE_INTERVAL]
     warmup_done = False
 
-    logger.info("Bot started. DRY_RUN=%s, interval=%s, sma=%s", config.DRY_RUN, config.CANDLE_INTERVAL, config.SMA_PERIOD)
+    logger.info("Bot started. DRY_RUN=%s, strategy=%s, interval=%s, sma=%s",
+                config.DRY_RUN, config.STRATEGY, config.CANDLE_INTERVAL, config.SMA_PERIOD)
 
     while True:
         try:

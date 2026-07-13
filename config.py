@@ -30,6 +30,12 @@ CANDLE_INTERVAL = "THREE_MINUTE"
 SMA_PERIOD = 20   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close")
 RISK_REWARD = 2.0
 
+# Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
+# "ORB" (Opening Range Breakout). backtest_today.py always compares both.
+STRATEGY = "SMMA_CROSS"
+OR_MINUTES = 15            # ORB: opening range = first N minutes of the session
+ORB_MAX_RISK_POINTS = 60   # ORB: skip the trade if the range (= risk) is wider
+
 # --- Execution / safety --------------------------------------------------
 PRODUCT_TYPE = "INTRADAY"
 ORDER_VARIETY = "NORMAL"
