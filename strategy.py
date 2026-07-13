@@ -353,6 +353,7 @@ class OpeningRangeBreakout:
             self._or_low = candle.low
             self._traded_long = False
             self._traded_short = False
+            self._or_announced = False
             if self.state == "IN_POSITION":  # shouldn't happen (square-off), but be safe
                 self._reset()
             return StrategyEvent(Signal.NONE, candle.close)
@@ -364,6 +365,16 @@ class OpeningRangeBreakout:
             self._or_low = min(self._or_low, candle.low)
             return StrategyEvent(Signal.NONE, candle.close)
 
+        # one-time diagnostic once the range is final, so zero-trade days
+        # are explainable (range too wide vs no breakout)
+        note = None
+        if not getattr(self, "_or_announced", True):
+            self._or_announced = True
+            rng = self._or_high - self._or_low
+            note = f"OR {self._or_low:.1f}-{self._or_high:.1f} ({rng:.1f} pts)"
+            if rng > self.max_risk_points:
+                note += f" > cap {self.max_risk_points:g} - breakouts will be SKIPPED"
+
         if self.state == "IN_POSITION":
             return self._manage(candle, sma)
 
@@ -372,15 +383,19 @@ class OpeningRangeBreakout:
         if candle.close > self._or_high and not self._traded_long:
             self._traded_long = True
             if or_range <= self.max_risk_points:
-                return self._enter("LONG", candle.close, self._or_low, candle)
+                return self._enter("LONG", candle.close, self._or_low, candle, note=note)
+            note = (note + " | " if note else "") + \
+                f"LONG breakout at {candle.close:.1f} skipped (range {or_range:.1f} > cap)"
         elif candle.close < self._or_low and not self._traded_short:
             self._traded_short = True
             if or_range <= self.max_risk_points:
-                return self._enter("SHORT", candle.close, self._or_high, candle)
+                return self._enter("SHORT", candle.close, self._or_high, candle, note=note)
+            note = (note + " | " if note else "") + \
+                f"SHORT breakout at {candle.close:.1f} skipped (range {or_range:.1f} > cap)"
 
-        return StrategyEvent(Signal.NONE, candle.close)
+        return StrategyEvent(Signal.NONE, candle.close, note=note)
 
-    def _enter(self, direction, entry_price, sl, candle):
+    def _enter(self, direction, entry_price, sl, candle, note=None):
         risk = abs(entry_price - sl)
         if risk <= 0:
             return StrategyEvent(Signal.NONE, candle.close)
@@ -393,10 +408,12 @@ class OpeningRangeBreakout:
         if direction == "LONG":
             self.target = entry_price + self.risk_reward * risk
             self.extreme_since_entry = candle.high
-            return StrategyEvent(Signal.ENTER_LONG_CE, entry_price, stop_loss=sl, target=self.target)
+            return StrategyEvent(Signal.ENTER_LONG_CE, entry_price, stop_loss=sl,
+                                 target=self.target, note=note)
         self.target = entry_price - self.risk_reward * risk
         self.extreme_since_entry = candle.low
-        return StrategyEvent(Signal.ENTER_SHORT_PE, entry_price, stop_loss=sl, target=self.target)
+        return StrategyEvent(Signal.ENTER_SHORT_PE, entry_price, stop_loss=sl,
+                             target=self.target, note=note)
 
     def _manage(self, candle, sma):
         long = self.direction == "LONG"

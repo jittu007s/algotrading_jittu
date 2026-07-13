@@ -8,9 +8,11 @@ strategies on identical data:
 
 Usage (same .env credentials as bot.py; reads market data only, never
 places orders):
-    python backtest_today.py               # last 5 trading sessions
-    python backtest_today.py 3             # last 3 sessions
-    python backtest_today.py 2026-07-10    # one specific date
+    python backtest_today.py                  # last 5 sessions, all strategies
+    python backtest_today.py 22               # last ~1 month of sessions
+    python backtest_today.py 22 ORB           # 1 month, ORB only
+    python backtest_today.py 2026-07-10       # one specific date
+    python backtest_today.py 2026-07-10 ORB   # one date, one strategy
 
 Each session is replayed with the live bot's rules: SMMA/indicators warm
 up on all candles BEFORE that session, entries blocked at/after 15:00,
@@ -79,7 +81,7 @@ def replay_day(day_candles, warmup, factory):
     if strategy.state != "IDLE":
         strategy.force_exit(price=None)
 
-    trades, open_trade = [], None
+    trades, open_trade, diag = [], None, []
     for candle in day_candles:
         t = candle.timestamp.time()
 
@@ -92,6 +94,10 @@ def replay_day(day_candles, warmup, factory):
             continue
 
         event = strategy.on_closed_candle(candle)
+
+        if event.note and event.signal not in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) \
+                and ("OR " in event.note or "skipped" in event.note):
+            diag.append(f"{candle.timestamp:%H:%M} {event.note}")
 
         if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE):
             if t >= NO_ENTRY_AFTER:
@@ -117,7 +123,7 @@ def replay_day(day_candles, warmup, factory):
     for tr in trades:
         move = tr["exit_price"] - tr["entry"]
         tr["points"] = move if tr["side"].startswith("LONG") else -move
-    return trades
+    return trades, diag
 
 
 def summarize(trades):
@@ -129,22 +135,27 @@ def summarize(trades):
 def main():
     target_dates = None
     n_days = 5
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
-        if "-" in arg:
+    selected = dict(STRATEGIES)
+    for arg in sys.argv[1:]:
+        if arg.upper() in STRATEGIES:
+            selected = {arg.upper(): STRATEGIES[arg.upper()]}
+        elif "-" in arg:
             target_dates = [datetime.strptime(arg, "%Y-%m-%d").date()]
         else:
             n_days = int(arg)
 
+    # enough calendar days to cover the requested sessions plus warm-up
+    calendar_days = max(21, int(n_days * 1.7) + 7)
+
     client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
     client.login()
     data = {}
-    for interval in {iv for _f, iv in STRATEGIES.values()}:
-        data[interval] = fetch_history(client, interval)
+    for interval in {iv for _f, iv in selected.values()}:
+        data[interval] = fetch_history(client, interval, calendar_days=calendar_days)
         save_csv(data[interval], interval)
     client.logout()
 
-    base = data[config.CANDLE_INTERVAL]
+    base = data[next(iter(selected.values()))[1]]
     all_dates = sorted({c.timestamp.date() for c in base})
     if target_dates is None:
         target_dates = all_dates[-n_days:]
@@ -152,7 +163,7 @@ def main():
           f"({all_dates[0]} .. {all_dates[-1]}); testing {len(target_dates)} session(s)\n")
 
     grand = {}
-    for name, (factory, interval) in STRATEGIES.items():
+    for name, (factory, interval) in selected.items():
         candles = data[interval]
         print(f"================ {name} ({_INTERVAL_LABEL.get(interval, interval)} candles) ================")
         g_trades, g_wins, g_total = 0, 0, 0.0
@@ -161,10 +172,12 @@ def main():
             day_candles = [c for c in candles if c.timestamp.date() == day]
             if not day_candles:
                 continue
-            trades = replay_day(day_candles, warmup, factory)
+            trades, diag = replay_day(day_candles, warmup, factory)
             n, w, tot = summarize(trades)
             g_trades += n; g_wins += w; g_total += tot
             print(f"  {day}: {n} trades, net {tot:+8.2f} pts")
+            for d in diag:
+                print(f"      · {d}")
             for tr in trades:
                 print(f"      {tr['side']:<10} {tr['entry_time']:%H:%M}->{tr['exit_time']:%H:%M} "
                       f"entry={tr['entry']:.2f} sl={tr['sl']:.2f} exit={tr['exit_price']:.2f} "
