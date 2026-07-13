@@ -1,0 +1,5 @@
+.env
+.scrip_master_cache.json
+__pycache__/
+*.pyc
+venv/
