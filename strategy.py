@@ -383,13 +383,13 @@ class OpeningRangeBreakout:
         if candle.close > self._or_high and not self._traded_long:
             self._traded_long = True
             if or_range <= self.max_risk_points:
-                return self._enter("LONG", candle.close, self._or_low, candle, note=note)
+                return self._enter("LONG", candle.close, self._or_low + or_range /2, candle, note=note)
             note = (note + " | " if note else "") + \
                 f"LONG breakout at {candle.close:.1f} skipped (range {or_range:.1f} > cap)"
         elif candle.close < self._or_low and not self._traded_short:
             self._traded_short = True
             if or_range <= self.max_risk_points:
-                return self._enter("SHORT", candle.close, self._or_high, candle, note=note)
+                return self._enter("SHORT", candle.close, self._or_high  - or_range /2, candle, note=note)
             note = (note + " | " if note else "") + \
                 f"SHORT breakout at {candle.close:.1f} skipped (range {or_range:.1f} > cap)"
 
