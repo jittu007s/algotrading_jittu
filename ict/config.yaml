@@ -1,0 +1,39 @@
+# ICT/SMC strategy configuration. Every knob the code reads lives here.
+
+capital: 200000              # account capital in INR (position sizing base)
+mode: paper                  # paper | live  (live also requires DRY_RUN=false in ../.env)
+
+risk:
+  risk_per_trade_pct: 0.75   # max risk per trade as % of capital
+  max_daily_loss_pct: 1.25   # hard daily stop as % of capital
+  equity_drawdown_stop_pct: 1.0   # stop trading if intraday equity falls this % from its peak
+
+timeframes:
+  bias_daily: ONE_DAY
+  bias_intraday: ONE_HOUR
+  setup: FIVE_MINUTE
+
+structure:
+  swing_k_bias: 2            # fractal width for daily/1H swings
+  swing_k_setup: 2           # fractal width for 5-min swings
+  sweep_min_pierce: 3.0      # points beyond the liquidity level to count as a sweep
+  sweep_needs_rejection: true  # candle must close back inside after piercing
+  displacement_body_mult: 1.5  # displacement body >= this x average body(20)
+  avg_body_period: 20
+  setup_validity_candles: 12 # sweep->MSS and FVG->entry must occur within this many bars
+
+options:
+  strike: ATM                # ATM | ITM1 (1 strike in the money)
+  delta_assumed: 0.5         # spot->premium conversion for sizing (0.6 if ITM1)
+  avoid_expiry_afternoon: true
+
+session:
+  skip_first_minutes: 15
+  no_entry_after: "14:45"
+  square_off: "15:10"
+
+telegram:
+  enabled: false             # set true + TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID in ../.env
+
+journal:
+  db_path: ict_journal.sqlite
