@@ -23,6 +23,12 @@ structure:
   setup_validity_candles: 12 # sweep->MSS and FVG->entry must occur within this many bars
   entry_point: edge          # edge = first touch of the FVG (more fills) | midpoint (better price)
 
+management:
+  partial_at_r: 1.0            # bank the partial + move stop to entry at this R multiple
+  trail_start: after_partial   # after_partial = trail swings only once +1R is banked (recommended)
+                               # immediate = trail from entry (tight; scratches many trades)
+  swing_trail_buffer: 2.0      # points beyond the swing before the stop sits
+
 options:
   strike: ATM                # ATM | ITM1 (1 strike in the money)
   delta_assumed: 0.5         # spot->premium conversion for sizing (0.6 if ITM1)

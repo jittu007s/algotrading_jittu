@@ -19,7 +19,7 @@ from .datafeed import PollingFeed
 from .models import Bias, Candle, LiquidityLevel, SwingKind
 from .risk import DayRiskManager, size_position
 from .structure import (SetupScanner, combine_bias, detect_bias, entry_level,
-                        entry_triggered, setup_invalidated, find_swings)
+                        entry_triggered, latest_swing_stop, setup_invalidated)
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("ict.backtest")
@@ -108,18 +108,18 @@ def run(n_sessions: int = 10) -> None:
                     trade = None
                 else:
                     fav = (c.high - trade["entry"]) if long else (trade["entry"] - c.low)
-                    if not trade["partial"] and fav >= trade["risk"]:
+                    if not trade["partial"] and fav >= cfg.management.partial_at_r * trade["risk"]:
                         trade["partial"] = True
                         trade["stop"] = trade["entry"]
-                    swings = find_swings(scanner.candles[-40:], scanner.swing_k)
-                    if long:
-                        lows = [s.price for s in swings if s.kind == SwingKind.LOW]
-                        if lows:
-                            trade["stop"] = max(trade["stop"], lows[-1])
-                    else:
-                        highs = [s.price for s in swings if s.kind == SwingKind.HIGH]
-                        if highs:
-                            trade["stop"] = min(trade["stop"], highs[-1])
+                    may_trail = trade["partial"] or cfg.management.trail_start == "immediate"
+                    if may_trail:
+                        lvl = latest_swing_stop(scanner.candles[-40:], scanner.swing_k,
+                                                long, cfg.management.swing_trail_buffer)
+                        if lvl is not None:
+                            if long and lvl < c.close:
+                                trade["stop"] = max(trade["stop"], lvl)
+                            elif not long and lvl > c.close:
+                                trade["stop"] = min(trade["stop"], lvl)
 
             # ---- scan / enter ----------------------------------------
             setup = scanner.on_candle(c, bias)

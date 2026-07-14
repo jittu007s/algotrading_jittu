@@ -38,6 +38,13 @@ class SessionCfg:
 
 
 @dataclass(frozen=True)
+class ManagementCfg:
+    partial_at_r: float
+    trail_start: str
+    swing_trail_buffer: float
+
+
+@dataclass(frozen=True)
 class OptionsCfg:
     strike: str
     delta_assumed: float
@@ -51,6 +58,7 @@ class IctConfig:
     risk: RiskCfg
     structure: StructureCfg
     session: SessionCfg
+    management: ManagementCfg
     options: OptionsCfg
     bias_daily_tf: str
     bias_intraday_tf: str
@@ -84,6 +92,11 @@ def load(path: Path = CONFIG_PATH) -> IctConfig:
             skip_first_minutes=int(raw["session"]["skip_first_minutes"]),
             no_entry_after=_parse_time(raw["session"]["no_entry_after"]),
             square_off=_parse_time(raw["session"]["square_off"]),
+        ),
+        management=ManagementCfg(
+            partial_at_r=float(raw.get("management", {}).get("partial_at_r", 1.0)),
+            trail_start=str(raw.get("management", {}).get("trail_start", "after_partial")),
+            swing_trail_buffer=float(raw.get("management", {}).get("swing_trail_buffer", 2.0)),
         ),
         options=OptionsCfg(
             strike=str(raw["options"]["strike"]),

@@ -236,6 +236,18 @@ def entry_triggered(setup: Setup, candle: Candle, mode: str = "midpoint") -> boo
     return candle.low <= level <= candle.high
 
 
+def latest_swing_stop(candles: List[Candle], k: int, long: bool,
+                      buffer: float = 0.0) -> Optional[float]:
+    """Stop level implied by the most recent confirmed swing: swing low -
+    buffer for longs, swing high + buffer for shorts. None if no swing."""
+    swings = find_swings(candles, k)
+    if long:
+        lows = [s.price for s in swings if s.kind == SwingKind.LOW]
+        return (lows[-1] - buffer) if lows else None
+    highs = [s.price for s in swings if s.kind == SwingKind.HIGH]
+    return (highs[-1] + buffer) if highs else None
+
+
 def setup_invalidated(setup: Setup, candle: Candle) -> bool:
     """Setup dies if price trades back beyond the sweep-anchored stop
     before the entry fills."""

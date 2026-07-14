@@ -23,7 +23,7 @@ from .models import Bias, Candle, LiquidityLevel, PaperTrade, Setup, SwingKind
 from .order_manager import OrderManager
 from .risk import DayRiskManager, size_position
 from .structure import (SetupScanner, entry_level, entry_triggered,
-                        setup_invalidated, find_swings)
+                        latest_swing_stop, setup_invalidated)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -201,7 +201,7 @@ class Engine:
             return
 
         favorable = (candle.high - trade.entry_spot) if long else (trade.entry_spot - candle.low)
-        if not trade.partial_done and favorable >= risk:
+        if not trade.partial_done and favorable >= self.cfg.management.partial_at_r * risk:
             trade.partial_done = True
             lots = self.trade_ctx["lots"]
             if lots >= 2 and act:
@@ -212,16 +212,19 @@ class Engine:
             trade.stop_spot = trade.entry_spot
             self.journal.log_signal("partial_1R", {"new_stop": trade.stop_spot})
 
-        # trail below/above the most recent confirmed 5m swing
-        swings = find_swings(self.scanner.candles[-40:], self.scanner.swing_k)
-        if long:
-            lows = [s.price for s in swings if s.kind == SwingKind.LOW]
-            if lows:
-                trade.stop_spot = max(trade.stop_spot, lows[-1])
-        else:
-            highs = [s.price for s in swings if s.kind == SwingKind.HIGH]
-            if highs:
-                trade.stop_spot = min(trade.stop_spot, highs[-1])
+        # Trail behind the most recent confirmed 5m swing - but only once
+        # the trade has banked +1R (unless configured immediate). Trailing
+        # from entry uses the entry pullback itself as the "swing" and
+        # scratches winners within a couple of candles.
+        may_trail = trade.partial_done or self.cfg.management.trail_start == "immediate"
+        if may_trail:
+            lvl = latest_swing_stop(self.scanner.candles[-40:], self.scanner.swing_k,
+                                    long, self.cfg.management.swing_trail_buffer)
+            if lvl is not None:
+                if long and lvl < candle.close:
+                    trade.stop_spot = max(trade.stop_spot, lvl)
+                elif not long and lvl > candle.close:
+                    trade.stop_spot = min(trade.stop_spot, lvl)
 
     def _exit(self, candle: Candle, reason: str, act: bool, price: float | None = None) -> None:
         trade = self.trade
