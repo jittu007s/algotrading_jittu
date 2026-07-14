@@ -58,8 +58,11 @@ class Signal(Enum):
 
 class ExitReason(Enum):
     STOP_LOSS = "stop_loss"
-    TRAILING_STOP = "trailing_stop"
+    BE_STOP = "be_stop"
     TARGET_HIT = "target_hit"
+    TARGET_3R = "target_3r"
+    TIMEOUT_EXIT = "timeout_prev_extreme"
+    TRAILING_STOP = "trailing_stop"
     SMA_DOUBLE_TOUCH = "sma_double_touch"
     TIME_EXIT = "time_exit"
     FORCED_EOD = "forced_eod"
@@ -291,85 +294,107 @@ class SmaCrossOptionStrategy:
 
 
 class OpeningRangeBreakout:
-    """Opening Range Breakout (ORB) - one of the oldest and most widely
-    documented professional intraday strategies (Crabel 1990; validated on
-    modern data by Zarattini & Aziz 2023), adapted to this bot's framework:
+    """Opening Range Breakout with the full user-specified trade handling.
 
-      - Opening range (OR) = the high/low of the first `or_minutes` of the
-        session (default 15 min = the first five 3-minute candles).
-      - LONG (buy ATM CE): a candle CLOSES above the OR high. Stop = OR low.
-      - SHORT (buy ATM PE): a candle CLOSES below the OR low. Stop = OR high.
-      - Risk guard: if the OR is wider than `max_risk_points`, the trade is
-        skipped - a stop further than that is not worth an ATM option.
-      - Management is identical to the SMMA strategy: at risk_reward x risk
-        the stop locks +/-1R and trails the SMMA; exits on the trailed stop.
-      - Discipline: at most ONE long and ONE short attempt per day - a core
-        part of why ORB survives costs. No re-entries after a stop-out.
+    ENTRIES
+      - Opening range (OR) = high/low of the first `or_minutes` of the day.
+      - LONG (buy CE): a candle CLOSES above the OR high; SHORT (buy PE):
+        a close below the OR low. Stop = opposite side of the range; the
+        trade is skipped if the range exceeds `max_risk_points`.
+      - After a LONG stop-out, the long trigger level becomes the DAY's
+        high so far (mirror for shorts) - re-entry must beat it.
+      - Once BOTH sides have stopped out, any further entry requires a
+        touch of the (updated) OR high/low, then a retracement of at
+        least `retrace_points`, then a retest of the same level. The
+        retest entry's stop is the retracement extreme.
 
-    Exposes the same interface/state fields as SmaCrossOptionStrategy so
-    bot.py and the backtesters can drive either interchangeably.
+    MANAGEMENT (rr_shift, per spec)
+      - At `risk_reward` x risk (2R): SL shifts to the ENTRY price, the
+        target extends to `extended_target_r` x risk (3R), and a
+        `timeout_minutes` clock starts. Target -> exit at 3R; SL -> exit
+        at entry; clock expiry -> exit at the previous candle's high
+        (long) / low (short), falling back to the close.
+      - Independent guard: in profit but 2R still missing after
+        `be_after_minutes` -> SL shifts to entry.
     """
 
-    def __init__(self, sma_period: int = 20, risk_reward: float = 2.3,
-                 or_minutes: int = 3, max_risk_points: float = 75.0):
-        self.sma_period = sma_period
+    def __init__(self, sma_period: int = 20, risk_reward: float = 2.0,
+                 or_minutes: int = 15, max_risk_points: float = 60.0,
+                 extended_target_r: float = 3.0, timeout_minutes: int = 15,
+                 be_after_minutes: int = 30, retrace_points: float = 15.0,
+                 stop_mode: str = "opposite"):
+        # sma_period retained for constructor compatibility (unused)
         self.risk_reward = risk_reward
         self.or_minutes = or_minutes
         self.max_risk_points = max_risk_points
-
-        self._seed_closes = []
-        self._smma = None
+        self.extended_target_r = extended_target_r
+        self.timeout_minutes = timeout_minutes
+        self.be_after_minutes = be_after_minutes
+        self.retrace_points = retrace_points
+        self.stop_mode = stop_mode
 
         self._session = None
+        self._prev = None
+        self._reset_session()
+        self._reset_position()
+
+    # -- state resets -----------------------------------------------------
+    def _reset_session(self):
         self._or_high = None
         self._or_low = None
-        self._traded_long = False
-        self._traded_short = False
+        self._day_high = None
+        self._day_low = None
+        self._or_announced = False
+        self._long_done = False
+        self._short_done = False
+        self._long_stopped = False
+        self._short_stopped = False
+        self._machine = None          # None | wait_touch | wait_retrace | wait_retest
+        self._machine_side = None
+        self._retrace_extreme = None
 
+    def _reset_position(self):
         self.state = "IDLE"
         self.direction = None
         self.entry_price = None
         self.stop_loss = None
         self.target = None
-        self.trailing = False
         self._risk = None
-        self.extreme_since_entry = None
+        self._shifted = False
+        self._shift_t = None
+        self._entry_t = None
+        self._from_retest = False
+        self.trailing = False   # kept for interface compatibility
 
-    def _update_smma(self, close):
-        if self._smma is None:
-            self._seed_closes.append(close)
-            if len(self._seed_closes) >= self.sma_period:
-                self._smma = sum(self._seed_closes) / self.sma_period
-        else:
-            self._smma = (self._smma * (self.sma_period - 1) + close) / self.sma_period
-        return self._smma
-
+    # -- main --------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
-        sma = self._update_smma(candle.close)
+        from datetime import timedelta
 
         day = candle.timestamp.date()
         if day != self._session:
             self._session = day
+            self._reset_session()
+            if self.state == "IN_POSITION":
+                self._reset_position()
             self._or_high = candle.high
             self._or_low = candle.low
-            self._traded_long = False
-            self._traded_short = False
-            self._or_announced = False
-            if self.state == "IN_POSITION":  # shouldn't happen (square-off), but be safe
-                self._reset()
+            self._day_high = candle.high
+            self._day_low = candle.low
+            self._prev = candle
             return StrategyEvent(Signal.NONE, candle.close)
+
+        self._day_high = max(self._day_high, candle.high)
+        self._day_low = min(self._day_low, candle.low)
 
         session_open = candle.timestamp.replace(hour=9, minute=15, second=0, microsecond=0)
-        in_or_window = (candle.timestamp - session_open).total_seconds() / 60 < self.or_minutes
-        if in_or_window:
+        if (candle.timestamp - session_open).total_seconds() / 60 < self.or_minutes:
             self._or_high = max(self._or_high, candle.high)
             self._or_low = min(self._or_low, candle.low)
+            self._prev = candle
             return StrategyEvent(Signal.NONE, candle.close)
 
-        # one-time diagnostic once the range is final, so zero-trade days
-        # are explainable (range too wide vs no breakout)
         note = None
-        if not getattr(self, "_or_announced", True):
+        if not self._or_announced:
             self._or_announced = True
             rng = self._or_high - self._or_low
             note = f"OR {self._or_low:.1f}-{self._or_high:.1f} ({rng:.1f} pts)"
@@ -377,86 +402,196 @@ class OpeningRangeBreakout:
                 note += f" > cap {self.max_risk_points:g} - breakouts will be SKIPPED"
 
         if self.state == "IN_POSITION":
-            return self._manage(candle, sma)
+            ev = self._manage(candle)
+            if ev.signal == Signal.EXIT:
+                shift_note = self._after_exit(ev.reason)
+                if shift_note:
+                    ev.note = (ev.note + " | " if ev.note else "") + shift_note
+            self._prev = candle
+            return ev
 
-        # --- entries: close through the opening range, one shot per side ---
-        or_range = self._or_high - self._or_low
-        if candle.close > self._or_high and not self._traded_long:
-            self._traded_long = True
-            if or_range <= self.max_risk_points:
-                return self._enter("LONG", candle.close, self._or_low + or_range /2, candle, note=note)
-            note = (note + " | " if note else "") + \
-                f"LONG breakout at {candle.close:.1f} skipped (range {or_range:.1f} > cap)"
-        elif candle.close < self._or_low and not self._traded_short:
-            self._traded_short = True
-            if or_range <= self.max_risk_points:
-                return self._enter("SHORT", candle.close, self._or_high  - or_range /2, candle, note=note)
-            note = (note + " | " if note else "") + \
-                f"SHORT breakout at {candle.close:.1f} skipped (range {or_range:.1f} > cap)"
+        ev = self._entries(candle, note)
+        self._prev = candle
+        return ev
 
-        return StrategyEvent(Signal.NONE, candle.close, note=note)
+    # -- entries -----------------------------------------------------------
+    def _entries(self, c: Candle, note):
+        if self._long_done and self._short_done:
+            return StrategyEvent(Signal.NONE, c.close, note=note)
 
-    def _enter(self, direction, entry_price, sl, candle, note=None):
+        if self._machine is not None:
+            return self._machine_step(c, note)
+
+        rng = self._or_high - self._or_low
+        mid = self._or_low + rng / 2
+        if c.close > self._or_high and not self._long_done:
+            sl = mid if self.stop_mode == "mid_range" else self._or_low
+            return self._enter("LONG", c.close, sl, c, note)
+        if c.close < self._or_low and not self._short_done:
+            sl = mid if self.stop_mode == "mid_range" else self._or_high
+            return self._enter("SHORT", c.close, sl, c, note)
+        return StrategyEvent(Signal.NONE, c.close, note=note)
+
+    def _machine_step(self, c: Candle, note):
+        """Both sides stopped: touch -> retrace -> retest state machine."""
+        add = None
+        if self._machine == "wait_touch":
+            if c.high >= self._or_high and not self._long_done:
+                self._machine = "wait_retrace"
+                self._machine_side = "LONG"
+                self._retrace_extreme = c.low
+                add = f"retest: touched high {self._or_high:.1f}, waiting for retracement"
+            elif c.low <= self._or_low and not self._short_done:
+                self._machine = "wait_retrace"
+                self._machine_side = "SHORT"
+                self._retrace_extreme = c.high
+                add = f"retest: touched low {self._or_low:.1f}, waiting for retracement"
+        elif self._machine == "wait_retrace":
+            long = self._machine_side == "LONG"
+            level = self._or_high if long else self._or_low
+            self._retrace_extreme = min(self._retrace_extreme, c.low) if long \
+                else max(self._retrace_extreme, c.high)
+            retraced = (level - c.low >= self.retrace_points) if long \
+                else (c.high - level >= self.retrace_points)
+            if retraced:
+                self._machine = "wait_retest"
+                add = f"retest: retraced {self.retrace_points:g}+ pts, waiting for retest of {level:.1f}"
+        elif self._machine == "wait_retest":
+            long = self._machine_side == "LONG"
+            level = self._or_high if long else self._or_low
+            self._retrace_extreme = min(self._retrace_extreme, c.low) if long \
+                else max(self._retrace_extreme, c.high)
+            hit = c.high >= level if long else c.low <= level
+            if hit:
+                sl = self._retrace_extreme
+                risk = abs(level - sl)
+                self._machine = "wait_touch"   # re-arm for a future cycle
+                self._machine_side = None
+                if 0 < risk <= self.max_risk_points:
+                    return self._enter("LONG" if long else "SHORT", level, sl, c, note,
+                                       from_retest=True)
+                add = f"retest entry skipped: risk {risk:.1f} outside cap"
+        if add:
+            note = (note + " | " if note else "") + add
+        return StrategyEvent(Signal.NONE, c.close, note=note)
+
+    def _enter(self, direction, entry_price, sl, candle, note=None, from_retest=False):
         risk = abs(entry_price - sl)
         if risk <= 0:
-            return StrategyEvent(Signal.NONE, candle.close)
+            return StrategyEvent(Signal.NONE, candle.close, note=note)
+        if risk > self.max_risk_points:
+            note = (note + " | " if note else "") + \
+                f"{direction} entry at {entry_price:.1f} skipped: stop {sl:.1f} = " \
+                f"{risk:.1f} pts risk > cap {self.max_risk_points:g}"
+            return StrategyEvent(Signal.NONE, candle.close, note=note)
         self.state = "IN_POSITION"
         self.direction = direction
         self.entry_price = entry_price
         self.stop_loss = sl
         self._risk = risk
-        self.trailing = False
+        self._shifted = False
+        self._shift_t = None
+        self._entry_t = candle.timestamp
+        self._from_retest = from_retest
         if direction == "LONG":
             self.target = entry_price + self.risk_reward * risk
-            self.extreme_since_entry = candle.high
-            return StrategyEvent(Signal.ENTER_LONG_CE, entry_price, stop_loss=sl,
-                                 target=self.target, note=note)
-        self.target = entry_price - self.risk_reward * risk
-        self.extreme_since_entry = candle.low
-        return StrategyEvent(Signal.ENTER_SHORT_PE, entry_price, stop_loss=sl,
-                             target=self.target, note=note)
+            sig = Signal.ENTER_LONG_CE
+        else:
+            self.target = entry_price - self.risk_reward * risk
+            sig = Signal.ENTER_SHORT_PE
+        if from_retest:
+            note = (note + " | " if note else "") + "retest entry"
+        return StrategyEvent(sig, entry_price, stop_loss=sl, target=self.target, note=note)
 
-    def _manage(self, candle, sma):
+    # -- management (rr_shift + 30-min BE guard) ----------------------------
+    def _manage(self, c: Candle) -> StrategyEvent:
+        from datetime import timedelta
         long = self.direction == "LONG"
 
-        hit_sl = candle.low <= self.stop_loss if long else candle.high >= self.stop_loss
-        if hit_sl:
-            exit_price = self.stop_loss
-            reason = ExitReason.TRAILING_STOP if self.trailing else ExitReason.STOP_LOSS
-            self._reset()
-            return StrategyEvent(Signal.EXIT, exit_price, reason=reason)
+        hit = c.low <= self.stop_loss if long else c.high >= self.stop_loss
+        if hit:
+            at_entry = (self.stop_loss >= self.entry_price) if long \
+                else (self.stop_loss <= self.entry_price)
+            reason = ExitReason.BE_STOP if at_entry else ExitReason.STOP_LOSS
+            price = self.stop_loss
+            self._capture_exit_context()
+            self._reset_position()
+            return StrategyEvent(Signal.EXIT, price, reason=reason)
 
-        self.extreme_since_entry = max(self.extreme_since_entry, candle.high) if long \
-            else min(self.extreme_since_entry, candle.low)
+        note = None
+        if not self._shifted:
+            reached = (c.high >= self.entry_price + self.risk_reward * self._risk) if long \
+                else (c.low <= self.entry_price - self.risk_reward * self._risk)
+            if reached:
+                self._shifted = True
+                self._shift_t = c.timestamp
+                self.stop_loss = self.entry_price
+                self.target = (self.entry_price + self.extended_target_r * self._risk) if long \
+                    else (self.entry_price - self.extended_target_r * self._risk)
+                note = (f"{self.risk_reward:g}R reached: SL->entry {self.stop_loss:.1f}, "
+                        f"target {self.target:.1f}, {self.timeout_minutes}-min clock on")
+            elif c.timestamp - self._entry_t >= timedelta(minutes=self.be_after_minutes):
+                in_profit = c.close > self.entry_price if long else c.close < self.entry_price
+                be_set = (self.stop_loss >= self.entry_price) if long \
+                    else (self.stop_loss <= self.entry_price)
+                if in_profit and not be_set:
+                    self.stop_loss = self.entry_price
+                    note = (f"{self.be_after_minutes} min in profit without "
+                            f"{self.risk_reward:g}R: SL->entry {self.stop_loss:.1f}")
 
-        if not self.trailing:
-            hit_target = candle.high >= self.target if long else candle.low <= self.target
-            if hit_target:
-                self.trailing = True
-                if long:
-                    lock = self.entry_price + self._risk
-                    self.stop_loss = max(self.stop_loss, lock, sma if sma is not None else lock)
-                else:
-                    lock = self.entry_price - self._risk
-                    self.stop_loss = min(self.stop_loss, lock, sma if sma is not None else lock)
-                self.target = None
-                return StrategyEvent(Signal.NONE, candle.close,
-                                     stop_loss=self.stop_loss, note="trailing_activated")
-        elif sma is not None:
-            self.stop_loss = max(self.stop_loss, sma) if long else min(self.stop_loss, sma)
+        if self._shifted:
+            hit_tgt = c.high >= self.target if long else c.low <= self.target
+            if hit_tgt:
+                price = self.target
+                self._capture_exit_context()
+                self._reset_position()
+                return StrategyEvent(Signal.EXIT, price, reason=ExitReason.TARGET_3R)
+            if c.timestamp >= self._shift_t + timedelta(minutes=self.timeout_minutes):
+                lvl = (self._prev.high if long else self._prev.low) if self._prev else c.close
+                touched = c.high >= lvl if long else c.low <= lvl
+                price = lvl if touched else c.close
+                self._capture_exit_context()
+                self._reset_position()
+                return StrategyEvent(Signal.EXIT, price, reason=ExitReason.TIMEOUT_EXIT)
 
-        return StrategyEvent(Signal.NONE, candle.close)
+        return StrategyEvent(Signal.NONE, c.close, note=note)
+
+    def _capture_exit_context(self):
+        self._exited_direction = self.direction
+        self._exited_from_retest = getattr(self, "_from_retest", False)
+
+    def _after_exit(self, reason) -> str:
+        """Book-keeping after our own exit: level shifts and side flags.
+        Any stop (initial or breakeven) re-arms the side with the day's
+        extreme as its new level; a win retires the side (or, for a
+        retest-cycle win, the whole day)."""
+        note = ""
+        stopped = reason in (ExitReason.STOP_LOSS, ExitReason.BE_STOP)
+        direction = self._exited_direction
+        from_retest = self._exited_from_retest
+        if stopped:
+            if direction == "LONG":
+                self._long_stopped = True
+                self._or_high = self._day_high
+                note = f"level shift: long trigger -> day high {self._or_high:.1f}"
+            else:
+                self._short_stopped = True
+                self._or_low = self._day_low
+                note = f"level shift: short trigger -> day low {self._or_low:.1f}"
+            if self._long_stopped and self._short_stopped and self._machine is None:
+                self._machine = "wait_touch"
+                note += " | both sides stopped: retest mode ON"
+        else:
+            if from_retest:
+                self._long_done = True
+                self._short_done = True
+                note = "retest trade won - done for the day"
+            elif direction == "LONG":
+                self._long_done = True
+            else:
+                self._short_done = True
+        return note
 
     def force_exit(self, price, reason: ExitReason = ExitReason.FORCED_EOD) -> StrategyEvent:
-        self._reset()
+        self._reset_position()
         return StrategyEvent(Signal.EXIT, price, reason=reason)
-
-    def _reset(self):
-        self.state = "IDLE"
-        self.direction = None
-        self.entry_price = None
-        self.stop_loss = None
-        self.target = None
-        self.trailing = False
-        self._risk = None
-        self.extreme_since_entry = None

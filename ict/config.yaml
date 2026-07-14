@@ -24,9 +24,15 @@ structure:
   entry_point: edge          # edge = first touch of the FVG (more fills) | midpoint (better price)
 
 management:
+  style: swing_trail           # rr_shift = at 2R shift SL to entry, target 3R, 15-min timeout
+                               # swing_trail = partial + trail behind swing lows/highs
+  # rr_shift parameters:
+  shift_at_r: 2.0              # R multiple that triggers the shift
+  extended_target_r: 3.0       # target after the shift
+  timeout_minutes: 15          # after shifting, exit at prev candle high/low if neither hits
+  # swing_trail parameters:
   partial_at_r: 1.0            # bank the partial + move stop to entry at this R multiple
-  trail_start: after_partial   # after_partial = trail swings only once +1R is banked (recommended)
-                               # immediate = trail from entry (tight; scratches many trades)
+  trail_start: after_partial   # after_partial = trail swings only once the partial banked
   swing_trail_buffer: 2.0      # points beyond the swing before the stop sits
 
 options:

@@ -194,37 +194,75 @@ class Engine:
         assert trade is not None
         long = trade.direction == Bias.BULLISH
         risk = self.trade_ctx["risk_dist"]
+        mgmt = self.cfg.management
 
         hit_stop = candle.low <= trade.stop_spot if long else candle.high >= trade.stop_spot
         if hit_stop:
-            self._exit(candle, "stop", act, price=trade.stop_spot)
+            reason = "be_stop" if self.trade_ctx.get("shifted") else "stop"
+            self._exit(candle, reason, act, price=trade.stop_spot)
             return
 
+        if mgmt.style == "rr_shift":
+            self._manage_rr_shift(candle, act, long, risk)
+            return
+
+        # ---- swing_trail style ----
         favorable = (candle.high - trade.entry_spot) if long else (trade.entry_spot - candle.low)
-        if not trade.partial_done and favorable >= self.cfg.management.partial_at_r * risk:
+        if not trade.partial_done and favorable >= mgmt.partial_at_r * risk:
             trade.partial_done = True
             lots = self.trade_ctx["lots"]
             if lots >= 2 and act:
                 half = lots // 2
-                self.orders.sell_market(self.trade_ctx["option"], half, "partial_1R")
+                self.orders.sell_market(self.trade_ctx["option"], half, "partial")
                 self.trade_ctx["lots"] = lots - half
-            # pay yourself: stop to entry either way
             trade.stop_spot = trade.entry_spot
-            self.journal.log_signal("partial_1R", {"new_stop": trade.stop_spot})
+            self.journal.log_signal("partial", {"new_stop": trade.stop_spot})
 
-        # Trail behind the most recent confirmed 5m swing - but only once
-        # the trade has banked +1R (unless configured immediate). Trailing
-        # from entry uses the entry pullback itself as the "swing" and
-        # scratches winners within a couple of candles.
-        may_trail = trade.partial_done or self.cfg.management.trail_start == "immediate"
+        may_trail = trade.partial_done or mgmt.trail_start == "immediate"
         if may_trail:
             lvl = latest_swing_stop(self.scanner.candles[-40:], self.scanner.swing_k,
-                                    long, self.cfg.management.swing_trail_buffer)
+                                    long, mgmt.swing_trail_buffer)
             if lvl is not None:
                 if long and lvl < candle.close:
                     trade.stop_spot = max(trade.stop_spot, lvl)
                 elif not long and lvl > candle.close:
                     trade.stop_spot = min(trade.stop_spot, lvl)
+
+    def _manage_rr_shift(self, candle: Candle, act: bool, long: bool, risk: float) -> None:
+        """User-specified management: at shift_at_r the stop moves to the
+        entry price and the target extends to extended_target_r; if neither
+        the target nor the stop is hit within timeout_minutes, exit at the
+        previous candle's high (long) / low (short), else at the close."""
+        trade = self.trade
+        mgmt = self.cfg.management
+
+        if not self.trade_ctx.get("shifted"):
+            reached = (candle.high >= trade.entry_spot + mgmt.shift_at_r * risk) if long \
+                else (candle.low <= trade.entry_spot - mgmt.shift_at_r * risk)
+            if reached:
+                self.trade_ctx["shifted"] = True
+                self.trade_ctx["shift_t"] = candle.timestamp
+                trade.stop_spot = trade.entry_spot
+                self.trade_ctx["target"] = (trade.entry_spot + mgmt.extended_target_r * risk) if long \
+                    else (trade.entry_spot - mgmt.extended_target_r * risk)
+                self.journal.log_signal("rr_shift", {
+                    "stop": trade.stop_spot, "target": self.trade_ctx["target"]})
+                self.alerts.send(f"{mgmt.shift_at_r:g}R reached: SL -> entry "
+                                 f"{trade.stop_spot:.1f}, target {self.trade_ctx['target']:.1f}")
+
+        if self.trade_ctx.get("shifted"):
+            tgt = self.trade_ctx["target"]
+            hit_tgt = (candle.high >= tgt) if long else (candle.low <= tgt)
+            if hit_tgt:
+                self._exit(candle, "target_3r", act, price=tgt)
+                return
+            if candle.timestamp >= self.trade_ctx["shift_t"] + \
+                    timedelta(minutes=mgmt.timeout_minutes):
+                prev = self.scanner.candles[-2] if len(self.scanner.candles) >= 2 else None
+                lvl = (prev.high if long else prev.low) if prev else candle.close
+                touched = (candle.high >= lvl) if long else (candle.low <= lvl)
+                self._exit(candle, "timeout_prev_" + ("high" if long else "low"), act,
+                           price=lvl if touched else candle.close)
 
     def _exit(self, candle: Candle, reason: str, act: bool, price: float | None = None) -> None:
         trade = self.trade

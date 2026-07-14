@@ -39,6 +39,10 @@ class SessionCfg:
 
 @dataclass(frozen=True)
 class ManagementCfg:
+    style: str
+    shift_at_r: float
+    extended_target_r: float
+    timeout_minutes: int
     partial_at_r: float
     trail_start: str
     swing_trail_buffer: float
@@ -94,6 +98,10 @@ def load(path: Path = CONFIG_PATH) -> IctConfig:
             square_off=_parse_time(raw["session"]["square_off"]),
         ),
         management=ManagementCfg(
+            style=str(raw.get("management", {}).get("style", "rr_shift")),
+            shift_at_r=float(raw.get("management", {}).get("shift_at_r", 2.0)),
+            extended_target_r=float(raw.get("management", {}).get("extended_target_r", 3.0)),
+            timeout_minutes=int(raw.get("management", {}).get("timeout_minutes", 15)),
             partial_at_r=float(raw.get("management", {}).get("partial_at_r", 1.0)),
             trail_start=str(raw.get("management", {}).get("trail_start", "after_partial")),
             swing_trail_buffer=float(raw.get("management", {}).get("swing_trail_buffer", 2.0)),

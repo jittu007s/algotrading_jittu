@@ -86,6 +86,7 @@ def run(n_sessions: int = 10) -> None:
         pending_ttl = 0
         trade = None
         day_trades = []
+        prev_c = warm_m5[-1] if warm_m5 else None
 
         session_start = dtime(9, 15 + cfg.session.skip_first_minutes)
 
@@ -95,18 +96,35 @@ def run(n_sessions: int = 10) -> None:
             # ---- manage open trade -----------------------------------
             if trade is not None:
                 long = trade["dir"] == Bias.BULLISH
+                exit_spot = None
+                reason = None
                 hit = c.low <= trade["stop"] if long else c.high >= trade["stop"]
-                if hit or t >= cfg.session.square_off:
-                    exit_spot = trade["stop"] if hit else c.close
-                    move = (exit_spot - trade["entry"]) if long else (trade["entry"] - exit_spot)
-                    pnl = move * cfg.options.delta_assumed * 75 * trade["lots"]
-                    risk.record_trade(pnl)
-                    trade.update(exit=exit_spot, exit_t=c.timestamp,
-                                 reason="stop" if hit else "square_off",
-                                 points=move, pnl=pnl)
-                    day_trades.append(trade)
-                    trade = None
-                else:
+                if hit:
+                    exit_spot = trade["stop"]
+                    reason = "be_stop" if trade.get("shifted") else "stop"
+                elif t >= cfg.session.square_off:
+                    exit_spot, reason = c.close, "square_off"
+                elif cfg.management.style == "rr_shift":
+                    R = trade["risk"]
+                    if not trade["shifted"]:
+                        reached = (c.high >= trade["entry"] + cfg.management.shift_at_r * R) if long \
+                            else (c.low <= trade["entry"] - cfg.management.shift_at_r * R)
+                        if reached:
+                            trade["shifted"] = True
+                            trade["shift_t"] = c.timestamp
+                            trade["stop"] = trade["entry"]      # SL -> buy price
+                            trade["target"] = (trade["entry"] + cfg.management.extended_target_r * R) if long \
+                                else (trade["entry"] - cfg.management.extended_target_r * R)
+                    if trade["shifted"]:
+                        tgt = trade["target"]
+                        if (c.high >= tgt) if long else (c.low <= tgt):
+                            exit_spot, reason = tgt, "target_3r"
+                        elif c.timestamp >= trade["shift_t"] + timedelta(minutes=cfg.management.timeout_minutes):
+                            lvl = (prev_c.high if long else prev_c.low) if prev_c else c.close
+                            touched = (c.high >= lvl) if long else (c.low <= lvl)
+                            exit_spot = lvl if touched else c.close
+                            reason = "timeout_prev_" + ("high" if long else "low")
+                else:  # swing_trail
                     fav = (c.high - trade["entry"]) if long else (trade["entry"] - c.low)
                     if not trade["partial"] and fav >= cfg.management.partial_at_r * trade["risk"]:
                         trade["partial"] = True
@@ -120,6 +138,14 @@ def run(n_sessions: int = 10) -> None:
                                 trade["stop"] = max(trade["stop"], lvl)
                             elif not long and lvl > c.close:
                                 trade["stop"] = min(trade["stop"], lvl)
+                if exit_spot is not None:
+                    move = (exit_spot - trade["entry"]) if long else (trade["entry"] - exit_spot)
+                    pnl = move * cfg.options.delta_assumed * 75 * trade["lots"]
+                    risk.record_trade(pnl)
+                    trade.update(exit=exit_spot, exit_t=c.timestamp, reason=reason,
+                                 points=move, pnl=pnl)
+                    day_trades.append(trade)
+                    trade = None
 
             # ---- scan / enter ----------------------------------------
             setup = scanner.on_candle(c, bias)
@@ -145,12 +171,15 @@ def run(n_sessions: int = 10) -> None:
                         funnel["entered"] += 1
                         trade = {"dir": pending.bias, "entry": entry,
                                  "stop": pending.stop_spot, "risk": dist,
-                                 "lots": lots, "partial": False,
+                                 "lots": lots, "partial": False, "shifted": False,
+                                 "shift_t": None, "target": None,
                                  "entry_t": c.timestamp}
                     else:
                         funnel["skipped_oversize"] += 1
                         oversize_dists.append(dist)
                     pending = None
+
+            prev_c = c
 
         if bias == Bias.NEUTRAL:
             funnel["neutral_days"] += 1

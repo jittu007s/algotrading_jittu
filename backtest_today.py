@@ -37,8 +37,13 @@ STRATEGIES = {
         sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD),
         config.CANDLE_INTERVAL),
     "ORB": (lambda: OpeningRangeBreakout(
-        sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD,
-        or_minutes=config.OR_MINUTES, max_risk_points=config.ORB_MAX_RISK_POINTS),
+        risk_reward=config.RISK_REWARD,
+        or_minutes=config.OR_MINUTES, max_risk_points=config.ORB_MAX_RISK_POINTS,
+        extended_target_r=config.ORB_EXTENDED_TARGET_R,
+        timeout_minutes=config.ORB_TIMEOUT_MINUTES,
+        be_after_minutes=config.ORB_BE_AFTER_MINUTES,
+        retrace_points=config.ORB_RETRACE_POINTS,
+        stop_mode=config.ORB_STOP_MODE),
         config.ORB_CANDLE_INTERVAL),
     "REGIME": (lambda: RegimeAdaptiveStrategy(), config.CANDLE_INTERVAL),
 }
@@ -96,7 +101,8 @@ def replay_day(day_candles, warmup, factory):
         event = strategy.on_closed_candle(candle)
 
         if event.note and event.signal not in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) \
-                and ("OR " in event.note or "skipped" in event.note):
+                and any(k in event.note for k in ("OR ", "skipped", "level shift",
+                                                  "retest", "SL->entry", "R reached")):
             diag.append(f"{candle.timestamp:%H:%M} {event.note}")
 
         if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE):

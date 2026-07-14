@@ -24,8 +24,13 @@ from strategy import Candle, OpeningRangeBreakout, Signal, SmaCrossOptionStrateg
 def build_strategy():
     if config.STRATEGY == "ORB":
         return OpeningRangeBreakout(
-            sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD,
-            or_minutes=config.OR_MINUTES, max_risk_points=config.ORB_MAX_RISK_POINTS)
+            risk_reward=config.RISK_REWARD,
+            or_minutes=config.OR_MINUTES, max_risk_points=config.ORB_MAX_RISK_POINTS,
+            extended_target_r=config.ORB_EXTENDED_TARGET_R,
+            timeout_minutes=config.ORB_TIMEOUT_MINUTES,
+            be_after_minutes=config.ORB_BE_AFTER_MINUTES,
+            retrace_points=config.ORB_RETRACE_POINTS,
+            stop_mode=config.ORB_STOP_MODE)
     if config.STRATEGY == "REGIME":
         return RegimeAdaptiveStrategy()
     return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
@@ -187,9 +192,8 @@ def main():
 
                 event = strategy.on_closed_candle(candle)
 
-                if event.note == "trailing_activated":
-                    logger.info("1:2 level reached - trailing mode ON, SL(underlying) moved to %.2f",
-                                event.stop_loss)
+                if event.note:
+                    logger.info("strategy note: %s", event.note)
 
                 if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) and not held_option:
                     if is_past_entry_cutoff(datetime.now()):
