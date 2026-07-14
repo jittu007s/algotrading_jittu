@@ -2,9 +2,9 @@
 
 Run from algo-trading/:  python -m ict.backtest_ict [N_SESSIONS]
 
-Uses 5-minute candles for setups (1-minute refinement can be added at the
-cost of much heavier data pulls), daily+1H for bias, and the same session
-rules as the engine. P&L is reported in spot points and in approximate
+Uses the configured setup timeframe (timeframes.setup in config.yaml,
+5-min or 3-min), daily+1H for bias, and the same session rules as the
+engine. P&L is reported in spot points and in approximate
 premium rupees via the configured delta.
 """
 
@@ -44,7 +44,7 @@ def run(n_sessions: int = 10) -> None:
     feed = PollingFeed()
     now = datetime.now()
 
-    m5 = feed.fetch("FIVE_MINUTE", now - timedelta(days=int(n_sessions * 1.7) + 10), now)
+    m5 = feed.fetch(cfg.setup_tf, now - timedelta(days=int(n_sessions * 1.7) + 10), now)
     h1 = feed.fetch("ONE_HOUR", now - timedelta(days=60), now)
     daily = feed.fetch("ONE_DAY", now - timedelta(days=180), now)
 
