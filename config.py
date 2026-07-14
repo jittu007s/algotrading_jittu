@@ -21,20 +21,20 @@ STRIKE_STEP = 50
 # revised periodically by the exchange (75 as of 2025). find_atm_option()
 # will use the lot size from the live instrument master when available and
 # fall back to this constant only if that field is missing.
-LOT_SIZE = 75
+LOT_SIZE = 65
 
 # --- Strategy parameters -----------------------------------------------
 # Angel One candle interval enum: ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE,
 # TEN_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY
 CANDLE_INTERVAL = "THREE_MINUTE"
-SMA_PERIOD = 20   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close")
-RISK_REWARD = 2.0
+SMA_PERIOD = 18   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close")
+RISK_REWARD = 2.5
 
 # Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
 # "ORB" (Opening Range Breakout). backtest_today.py always compares both.
 STRATEGY = "SMMA_CROSS"
-OR_MINUTES = 15            # ORB: opening range = first N minutes of the session
-ORB_MAX_RISK_POINTS = 60   # ORB: skip the trade if the range (= risk) is wider
+OR_MINUTES = 3            # ORB: opening range = first N minutes of the session
+ORB_MAX_RISK_POINTS = 80   # ORB: skip the trade if the range (= risk) is wider
 ORB_CANDLE_INTERVAL = "FIVE_MINUTE"  # ORB runs on 5-min candles (others use CANDLE_INTERVAL)
 
 # --- Execution / safety --------------------------------------------------
