@@ -309,8 +309,8 @@ class OpeningRangeBreakout:
     bot.py and the backtesters can drive either interchangeably.
     """
 
-    def __init__(self, sma_period: int = 20, risk_reward: float = 2.0,
-                 or_minutes: int = 15, max_risk_points: float = 60.0):
+    def __init__(self, sma_period: int = 20, risk_reward: float = 2.3,
+                 or_minutes: int = 3, max_risk_points: float = 75.0):
         self.sma_period = sma_period
         self.risk_reward = risk_reward
         self.or_minutes = or_minutes
