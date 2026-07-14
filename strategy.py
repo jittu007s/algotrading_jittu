@@ -59,6 +59,7 @@ class Signal(Enum):
 class ExitReason(Enum):
     STOP_LOSS = "stop_loss"
     TRAILING_STOP = "trailing_stop"
+    TARGET_HIT = "target_hit"
     SMA_DOUBLE_TOUCH = "sma_double_touch"
     TIME_EXIT = "time_exit"
     FORCED_EOD = "forced_eod"
