@@ -18,7 +18,7 @@ from . import config as cfg_mod
 from .datafeed import PollingFeed
 from .models import Bias, Candle, LiquidityLevel, SwingKind
 from .risk import DayRiskManager, size_position
-from .structure import (SetupScanner, combine_bias, detect_bias,
+from .structure import (SetupScanner, combine_bias, detect_bias, entry_level,
                         entry_triggered, setup_invalidated, find_swings)
 
 logging.basicConfig(level=logging.WARNING)
@@ -50,6 +50,10 @@ def run(n_sessions: int = 10) -> None:
 
     dates = sorted({c.timestamp.date() for c in m5})[-n_sessions:]
     all_trades = []
+    funnel = {"sweeps": 0, "sweep_expired_no_mss": 0, "mss_without_fvg": 0,
+              "setups": 0, "entered": 0, "expired_unentered": 0,
+              "invalidated": 0, "skipped_oversize": 0, "neutral_days": 0}
+    oversize_dists = []
 
     for day in dates:
         day_m5 = [c for c in m5 if c.timestamp.date() == day]
@@ -125,20 +129,33 @@ def run(n_sessions: int = 10) -> None:
 
             if pending and trade is None:
                 pending_ttl -= 1
-                if setup_invalidated(pending, c) or pending_ttl <= 0:
+                if setup_invalidated(pending, c):
+                    funnel["invalidated"] += 1
                     pending = None
-                elif in_window and risk.can_trade() and entry_triggered(pending, c):
-                    entry = pending.fvg.midpoint
+                elif pending_ttl <= 0:
+                    funnel["expired_unentered"] += 1
+                    pending = None
+                elif in_window and risk.can_trade() and \
+                        entry_triggered(pending, c, cfg.structure.entry_point):
+                    entry = entry_level(pending, cfg.structure.entry_point)
                     dist = abs(entry - pending.stop_spot)
                     lots = size_position(cfg.capital, cfg.risk.risk_per_trade_pct,
                                          dist, cfg.options.delta_assumed, 75)
                     if lots >= 1:
+                        funnel["entered"] += 1
                         trade = {"dir": pending.bias, "entry": entry,
                                  "stop": pending.stop_spot, "risk": dist,
                                  "lots": lots, "partial": False,
                                  "entry_t": c.timestamp}
+                    else:
+                        funnel["skipped_oversize"] += 1
+                        oversize_dists.append(dist)
                     pending = None
 
+        if bias == Bias.NEUTRAL:
+            funnel["neutral_days"] += 1
+        for k in ("sweeps", "sweep_expired_no_mss", "mss_without_fvg", "setups"):
+            funnel[k] += scanner.stats.get(k, 0)
         print(f"{day} bias={bias.value:<8} trades={len(day_trades)}"
               f"  pnl=₹{sum(tr['pnl'] for tr in day_trades):+9.0f}"
               + ("  [HALTED: " + risk.halt_reason + "]" if risk.halted else ""))
@@ -153,6 +170,19 @@ def run(n_sessions: int = 10) -> None:
     print(f"\nTOTAL: {len(all_trades)} trades, "
           f"win rate {(len(wins)/len(all_trades)) if all_trades else 0:.0%}, "
           f"net ~₹{total:+.0f} (delta-approximated premium, before charges)")
+    print("\nFUNNEL (why setups did or didn't become trades):")
+    print(f"  neutral-bias days (no trading): {funnel['neutral_days']}")
+    print(f"  sweeps detected:            {funnel['sweeps']}")
+    print(f"  ├─ expired without MSS:     {funnel['sweep_expired_no_mss']}")
+    print(f"  ├─ MSS but no FVG:          {funnel['mss_without_fvg']}")
+    print(f"  └─ full setups formed:      {funnel['setups']}")
+    print(f"     ├─ entered:              {funnel['entered']}")
+    print(f"     ├─ expired unentered:    {funnel['expired_unentered']} (no pullback to '{cfg.structure.entry_point}')")
+    print(f"     ├─ invalidated pre-fill: {funnel['invalidated']}")
+    print(f"     └─ skipped oversize:     {funnel['skipped_oversize']}"
+          + (f" (SL distances {min(oversize_dists):.0f}-{max(oversize_dists):.0f} pts;"
+             f" budget allows ~{cfg.capital*cfg.risk.risk_per_trade_pct/100/(cfg.options.delta_assumed*75):.0f} pts)"
+             if oversize_dists else ""))
 
 
 if __name__ == "__main__":

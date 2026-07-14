@@ -21,6 +21,7 @@ structure:
   displacement_body_mult: 1.5  # displacement body >= this x average body(20)
   avg_body_period: 20
   setup_validity_candles: 12 # sweep->MSS and FVG->entry must occur within this many bars
+  entry_point: edge          # edge = first touch of the FVG (more fills) | midpoint (better price)
 
 options:
   strike: ATM                # ATM | ITM1 (1 strike in the money)

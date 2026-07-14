@@ -22,7 +22,7 @@ brief, stated precisely:
 from __future__ import annotations
 
 import logging
-from collections import deque
+from collections import Counter, deque
 from typing import Deque, List, Optional
 
 from .models import (FVG, MSS, Bias, Candle, LiquidityLevel, Setup, Sweep,
@@ -104,6 +104,7 @@ class SetupScanner:
 
         self._pending_sweep: Optional[Sweep] = None
         self._sweep_index: Optional[int] = None
+        self.stats: Counter = Counter()   # funnel: sweeps / mss_no_fvg / setups / expired
 
     # -- context ---------------------------------------------------------
     def set_static_levels(self, levels: List[LiquidityLevel]) -> None:
@@ -143,6 +144,7 @@ class SetupScanner:
         if self._pending_sweep is not None and self._sweep_index is not None \
                 and i - self._sweep_index > self.validity:
             logger.debug("sweep expired without MSS")
+            self.stats["sweep_expired_no_mss"] += 1
             self._pending_sweep = None
 
         if self._pending_sweep is None:
@@ -164,6 +166,7 @@ class SetupScanner:
                 extreme = c.low if bias == Bias.BULLISH else c.high
                 self._pending_sweep = Sweep(level, extreme, c.timestamp, i)
                 self._sweep_index = i
+                self.stats["sweeps"] += 1
                 logger.info("sweep of %s @ %.2f (extreme %.2f)", level.label, level.price, extreme)
                 return
 
@@ -190,6 +193,7 @@ class SetupScanner:
         fvg = self._find_fvg(i, bias)
         if fvg is None:
             logger.info("MSS without FVG - no entry basis, discarding sweep")
+            self.stats["mss_without_fvg"] += 1
             self._pending_sweep = None
             return None
 
@@ -199,6 +203,7 @@ class SetupScanner:
             else sweep.extreme + self.min_pierce
         setup = Setup(bias=bias, sweep=sweep, mss=MSS(swing, i, c.timestamp),
                       fvg=fvg, stop_spot=round(stop, 2), created_index=i)
+        self.stats["setups"] += 1
         logger.info("setup complete: %s FVG %.2f-%.2f stop %.2f",
                     bias.value, fvg.low, fvg.high, setup.stop_spot)
         self._pending_sweep = None
@@ -216,10 +221,19 @@ class SetupScanner:
         return None
 
 
-def entry_triggered(setup: Setup, candle: Candle) -> bool:
-    """Entry: first pullback into the FVG midpoint."""
-    mid = setup.fvg.midpoint
-    return candle.low <= mid <= candle.high
+def entry_level(setup: Setup, mode: str = "midpoint") -> float:
+    """Where the resting entry sits: 'midpoint' of the FVG (the brief's
+    default) or its near 'edge' (first touch of the gap - fills far more
+    setups at slightly worse prices)."""
+    if mode == "edge":
+        return setup.fvg.high if setup.bias == Bias.BULLISH else setup.fvg.low
+    return setup.fvg.midpoint
+
+
+def entry_triggered(setup: Setup, candle: Candle, mode: str = "midpoint") -> bool:
+    """Entry: first pullback into the FVG entry level."""
+    level = entry_level(setup, mode)
+    return candle.low <= level <= candle.high
 
 
 def setup_invalidated(setup: Setup, candle: Candle) -> bool:

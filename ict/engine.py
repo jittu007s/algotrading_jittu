@@ -22,7 +22,8 @@ from .journal import Journal
 from .models import Bias, Candle, LiquidityLevel, PaperTrade, Setup, SwingKind
 from .order_manager import OrderManager
 from .risk import DayRiskManager, size_position
-from .structure import SetupScanner, entry_triggered, setup_invalidated, find_swings
+from .structure import (SetupScanner, entry_level, entry_triggered,
+                        setup_invalidated, find_swings)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -151,10 +152,10 @@ class Engine:
             if self.pending_expiry_index <= 0 or setup_invalidated(setup, candle):
                 self.pending_setup = None
             return
-        if not entry_triggered(setup, candle):
+        if not entry_triggered(setup, candle, self.cfg.structure.entry_point):
             return
 
-        entry_spot = setup.fvg.midpoint
+        entry_spot = entry_level(setup, self.cfg.structure.entry_point)
         sl_dist = abs(entry_spot - setup.stop_spot)
         direction = setup.bias.value
 

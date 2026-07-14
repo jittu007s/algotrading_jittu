@@ -27,6 +27,7 @@ class StructureCfg:
     displacement_body_mult: float
     avg_body_period: int
     setup_validity_candles: int
+    entry_point: str
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ def load(path: Path = CONFIG_PATH) -> IctConfig:
             displacement_body_mult=float(raw["structure"]["displacement_body_mult"]),
             avg_body_period=int(raw["structure"]["avg_body_period"]),
             setup_validity_candles=int(raw["structure"]["setup_validity_candles"]),
+            entry_point=str(raw["structure"].get("entry_point", "midpoint")),
         ),
         session=SessionCfg(
             skip_first_minutes=int(raw["session"]["skip_first_minutes"]),
