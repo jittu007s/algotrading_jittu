@@ -322,7 +322,7 @@ class OpeningRangeBreakout:
                  or_minutes: int = 15, max_risk_points: float = 60.0,
                  extended_target_r: float = 3.0, timeout_minutes: int = 15,
                  be_after_minutes: int = 30, retrace_points: float = 15.0,
-                 stop_mode: str = "opposite"):
+                 stop_mode: str = "opposite", retest_stop_lookback: int = 10):
         # sma_period retained for constructor compatibility (unused)
         self.risk_reward = risk_reward
         self.or_minutes = or_minutes
@@ -332,6 +332,7 @@ class OpeningRangeBreakout:
         self.be_after_minutes = be_after_minutes
         self.retrace_points = retrace_points
         self.stop_mode = stop_mode
+        self.retest_stop_lookback = retest_stop_lookback
 
         self._session = None
         self._prev = None
@@ -349,10 +350,12 @@ class OpeningRangeBreakout:
         self._short_done = False
         self._long_stopped = False
         self._short_stopped = False
-        # per-side retest cycles (active once both sides have stopped):
-        # each side independently walks touch -> retrace -> retest, so a
-        # failed high-side cycle never blocks a low-side opportunity.
+        # per-side retest cycles (active once both sides have stopped);
+        # each side runs independently so neither blocks the other.
         self._cycles = None
+        # rolling window of recent candles - the retest stop is the recent
+        # swing extreme, not the whole session's extreme.
+        self._recent = deque(maxlen=self.retest_stop_lookback)
 
     def _reset_position(self):
         self.state = "IDLE"
@@ -386,6 +389,7 @@ class OpeningRangeBreakout:
 
         self._day_high = max(self._day_high, candle.high)
         self._day_low = min(self._day_low, candle.low)
+        self._recent.append(candle)
 
         session_open = candle.timestamp.replace(hour=9, minute=15, second=0, microsecond=0)
         if (candle.timestamp - session_open).total_seconds() / 60 < self.or_minutes:
@@ -434,9 +438,14 @@ class OpeningRangeBreakout:
         return StrategyEvent(Signal.NONE, c.close, note=note)
 
     def _cycles_step(self, c: Candle, note):
-        """Both sides stopped: each side independently walks its
-        touch -> retrace -> retest cycle against its current level, so the
-        strategy keeps trading all day with adjusted levels."""
+        """Both sides stopped. The day extreme that a side's stop-out set was
+        already hit (that is how it became the extreme), so price is already
+        retracing AWAY from it. Each side therefore only needs two things:
+        (a) a genuine retracement of >= retrace_points away from the level,
+        then (b) a break back THROUGH the level in the trade direction ->
+        enter. The stop is the recent swing extreme (last N candles), not the
+        whole session's extreme, so a break hours after a big rally still
+        gets a tight, in-cap stop. Sides run independently."""
         adds = []
         for side in ("LONG", "SHORT"):
             if (side == "LONG" and self._long_done) or (side == "SHORT" and self._short_done):
@@ -444,33 +453,38 @@ class OpeningRangeBreakout:
             long = side == "LONG"
             level = self._or_high if long else self._or_low
             cy = self._cycles[side]
-            if cy["phase"] == "wait_touch":
-                touched = c.high >= level if long else c.low <= level
-                if touched:
-                    cy["phase"] = "wait_retrace"
-                    cy["extreme"] = c.low if long else c.high
-                    adds.append(f"retest[{side}]: touched {level:.1f}, waiting for retracement")
-            elif cy["phase"] == "wait_retrace":
-                cy["extreme"] = min(cy["extreme"], c.low) if long else max(cy["extreme"], c.high)
-                retraced = (level - c.low >= self.retrace_points) if long \
-                    else (c.high - level >= self.retrace_points)
-                if retraced:
-                    cy["phase"] = "wait_retest"
-                    adds.append(f"retest[{side}]: retraced {self.retrace_points:g}+ pts, "
-                                f"waiting for retest of {level:.1f}")
-            elif cy["phase"] == "wait_retest":
-                cy["extreme"] = min(cy["extreme"], c.low) if long else max(cy["extreme"], c.high)
-                hit = c.high >= level if long else c.low <= level
-                if hit:
-                    sl = cy["extreme"]
-                    risk = abs(level - sl)
-                    cy["phase"] = "wait_touch"   # re-arm this side for a future cycle
-                    cy["extreme"] = None
-                    if 0 < risk <= self.max_risk_points:
-                        if adds:
-                            note = (note + " | " if note else "") + " | ".join(adds)
-                        return self._enter(side, level, sl, c, note, from_retest=True)
-                    adds.append(f"retest[{side}] entry skipped: risk {risk:.1f} outside cap")
+
+            # furthest retracement away from the level since the cycle began
+            cur = c.low if long else c.high
+            cy["extreme"] = cur if cy["extreme"] is None else (
+                min(cy["extreme"], c.low) if long else max(cy["extreme"], c.high))
+            retrace = (level - cy["extreme"]) if long else (cy["extreme"] - level)
+
+            broke = (c.high >= level) if long else (c.low <= level)
+            if not broke:
+                continue
+            if retrace < self.retrace_points:
+                # touched the level again but never pulled far enough away -
+                # not a retest; reset the retracement anchor and keep waiting
+                cy["extreme"] = None
+                continue
+
+            # Stop = recent swing extreme (LONG: recent swing low; SHORT:
+            # recent swing high). On a clean monotone move the "recent swing"
+            # can be far, so CLAMP the stop to max_risk_points rather than
+            # skip - the retest entry always fires on a valid break-after-
+            # retracement, with risk bounded to the cap.
+            window = list(self._recent)[-self.retest_stop_lookback:] or [c]
+            sl = min(w.low for w in window) if long else max(w.high for w in window)
+            if abs(level - sl) > self.max_risk_points:
+                sl = (level - self.max_risk_points) if long else (level + self.max_risk_points)
+                clamp = " (stop clamped to cap)"
+            else:
+                clamp = ""
+            cy["extreme"] = None   # re-arm this side for a future cycle
+            note = (note + " | " if note else "") + \
+                f"retest[{side}] break of {level:.1f} after {retrace:.0f}-pt retrace{clamp}"
+            return self._enter(side, level, sl, c, note, from_retest=True)
         if adds:
             note = (note + " | " if note else "") + " | ".join(adds)
         return StrategyEvent(Signal.NONE, c.close, note=note)
@@ -580,12 +594,11 @@ class OpeningRangeBreakout:
                 note = f"level shift: short trigger -> day low {self._or_low:.1f}"
             if self._long_stopped and self._short_stopped:
                 if self._cycles is None:
-                    self._cycles = {"LONG": {"phase": "wait_touch", "extreme": None},
-                                    "SHORT": {"phase": "wait_touch", "extreme": None}}
+                    self._cycles = {"LONG": {"extreme": None}, "SHORT": {"extreme": None}}
                     note += " | both sides stopped: retest mode ON"
                 else:
                     # the stopped side's level moved - restart only its cycle
-                    self._cycles[direction] = {"phase": "wait_touch", "extreme": None}
+                    self._cycles[direction] = {"extreme": None}
         else:
             if from_retest:
                 self._long_done = True

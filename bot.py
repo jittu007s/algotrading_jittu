@@ -30,7 +30,8 @@ def build_strategy():
             timeout_minutes=config.ORB_TIMEOUT_MINUTES,
             be_after_minutes=config.ORB_BE_AFTER_MINUTES,
             retrace_points=config.ORB_RETRACE_POINTS,
-            stop_mode=config.ORB_STOP_MODE)
+            stop_mode=config.ORB_STOP_MODE,
+            retest_stop_lookback=config.ORB_RETEST_STOP_LOOKBACK)
     if config.STRATEGY == "REGIME":
         return RegimeAdaptiveStrategy()
     return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
