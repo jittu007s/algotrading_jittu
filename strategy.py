@@ -194,19 +194,19 @@ class SmaCrossOptionStrategy:
         prev_candle = self._candles[-2]  # candle immediately before the entry candle
 
         if self.direction == "LONG":
-            sl = entry_price -30
+            sl = entry_price - 30
             risk = entry_price - sl
             if risk <= 0:
-                risk = entry_price * 0.2  # degenerate fallback, shouldn't normally happen
+                risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
                 sl = entry_price - risk
             target = entry_price + self.risk_reward * risk
             signal = Signal.ENTER_LONG_CE
             self.extreme_since_entry = candle.high
         else:
-            sl = entry_price -30
+            sl = entry_price + 30
             risk = sl - entry_price
             if risk <= 0:
-                risk = entry_price * 0.2
+                risk = entry_price * 0.005
                 sl = entry_price + risk
             target = entry_price - self.risk_reward * risk
             signal = Signal.ENTER_SHORT_PE
