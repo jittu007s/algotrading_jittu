@@ -32,7 +32,7 @@ RISK_REWARD = 2.5
 
 # Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
 # "ORB" (Opening Range Breakout). backtest_today.py always compares both.
-STRATEGY = "ORB"
+STRATEGY = "PULLBACK"   # "PULLBACK" (mark high/low, cross->return->confirm) | "ORB" | "SMMA_CROSS" | "REGIME"
 OR_MINUTES = 3             # ORB: opening range = first N minutes of the session
 ORB_MAX_RISK_POINTS = 60   # ORB: skip the trade if the range (= risk) is wider
 ORB_EXTENDED_TARGET_R = 3.0   # after 2R the target extends to this R multiple
@@ -42,6 +42,14 @@ ORB_RETRACE_POINTS = 15       # retest mode: minimum retracement before the rete
 ORB_RETEST_STOP_LOOKBACK = 10 # retest stop = extreme of the last N candles (recent swing)
 ORB_STOP_MODE = "mid_range"   # initial-entry stop: "mid_range" (user experiment) | "opposite"
 ORB_CANDLE_INTERVAL = "THREE_MINUTE"  # candle timeframe ORB runs on
+
+# --- PULLBACK strategy (mark 9:15-9:30 high/low, cross -> return -> confirm) ---
+PB_OR_MINUTES = 15            # marking window in minutes (15 = until 09:30)
+PB_RISK_REWARD = 2.0          # initial 1:2
+PB_MAX_RISK_POINTS = 60       # stop clamp
+PB_NUM_LOTS = 1               # >1 enables the 50%-at-2R scale-out with 4R runner
+PB_PULLBACK_VALIDITY = 20     # candles a cross stays valid awaiting return+confirm
+PB_CANDLE_INTERVAL = "THREE_MINUTE"
 
 # --- Execution / safety --------------------------------------------------
 PRODUCT_TYPE = "INTRADAY"

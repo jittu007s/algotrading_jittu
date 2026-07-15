@@ -613,3 +613,222 @@ class OpeningRangeBreakout:
     def force_exit(self, price, reason: ExitReason = ExitReason.FORCED_EOD) -> StrategyEvent:
         self._reset_position()
         return StrategyEvent(Signal.EXIT, price, reason=reason)
+
+
+class PullbackConfirmStrategy:
+    """Marked-range pullback-and-confirm entry (user spec, 8-Jul iteration).
+
+    RULES
+      1. Mark the day's high/low over the opening window (default first 15
+         min, i.e. until 09:30). No trade on the first breakout of either.
+      2. After the window, the FIRST cross of a marked level is only noted,
+         never traded. Wait for price to come BACK to that level.
+      3. On the return, wait for a later candle to CLOSE beyond the level
+         (above the high for longs, below the low for shorts).
+      4. That confirming close initiates the trade at its close price.
+         Stop = the pullback swing extreme (lowest low of the return leg for
+         longs; highest high for shorts), clamped to `max_risk_points`.
+
+    MANAGEMENT
+      - Initial target = entry +/- 2R (RR 1:2).
+      - On reaching 2R:
+          * >1 lot: book 50% at 2R, move the runner's stop to +1R, and
+            extend the runner's target another 2R beyond the booked target
+            (entry +/- 4R).
+          * 1 lot: exit fully at 2R (a single F&O lot cannot be split).
+      - Runner exits at 4R (target) or the +1R stop.
+
+    Both sides are armed against the frozen levels; only one position is
+    open at a time. After any exit both sides reset to wait_cross, so a new
+    trade needs a fresh cross -> return -> confirm sequence.
+    """
+
+    def __init__(self, or_minutes: int = 15, risk_reward: float = 2.0,
+                 max_risk_points: float = 60.0, num_lots: int = 1,
+                 pullback_validity: int = 20):
+        self.or_minutes = or_minutes
+        self.risk_reward = risk_reward          # initial reward multiple (2 = 1:2)
+        self.max_risk_points = max_risk_points
+        self.num_lots = num_lots
+        self.pullback_validity = pullback_validity
+
+        self._session = None
+        self._reset_session()
+        self._reset_position()
+
+    # -- resets -----------------------------------------------------------
+    def _reset_session(self):
+        self._hi = None
+        self._lo = None
+        self._announced = False
+        self._cycles = {
+            "LONG": {"phase": "wait_cross", "ext": None, "since_cross": 0},
+            "SHORT": {"phase": "wait_cross", "ext": None, "since_cross": 0},
+        }
+
+    def _reset_position(self):
+        self.state = "IDLE"
+        self.direction = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.target = None
+        self._risk = None
+        self._scaled = False
+        self._booked_lots = 0
+        self._booked_price = None
+        self._lots = self.num_lots
+        self.trailing = False   # interface compatibility
+
+    # -- main -------------------------------------------------------------
+    def on_closed_candle(self, candle: Candle) -> StrategyEvent:
+        day = candle.timestamp.date()
+        if day != self._session:
+            self._session = day
+            self._reset_session()
+            if self.state == "IN_POSITION":
+                self._reset_position()
+            self._hi, self._lo = candle.high, candle.low
+            return StrategyEvent(Signal.NONE, candle.close)
+
+        session_open = candle.timestamp.replace(hour=9, minute=15, second=0, microsecond=0)
+        in_window = (candle.timestamp - session_open).total_seconds() / 60 < self.or_minutes
+        if in_window:
+            self._hi = max(self._hi, candle.high)
+            self._lo = min(self._lo, candle.low)
+            return StrategyEvent(Signal.NONE, candle.close)
+
+        note = None
+        if not self._announced:
+            self._announced = True
+            note = f"marked range {self._lo:.1f}-{self._hi:.1f} (waiting for cross->return->confirm)"
+
+        if self.state == "IN_POSITION":
+            return self._manage(candle, note)
+        return self._scan(candle, note)
+
+    # -- entry state machine ---------------------------------------------
+    def _scan(self, c: Candle, note):
+        adds = []
+        for side in ("LONG", "SHORT"):
+            long = side == "LONG"
+            level = self._hi if long else self._lo
+            cy = self._cycles[side]
+            ph = cy["phase"]
+
+            if ph == "wait_cross":
+                if (c.high > level) if long else (c.low < level):
+                    cy["phase"] = "wait_return"
+                    cy["since_cross"] = 0
+                    adds.append(f"{side}: crossed {level:.1f} (1st cross ignored, awaiting return)")
+            elif ph == "wait_return":
+                cy["since_cross"] += 1
+                if cy["since_cross"] > self.pullback_validity:
+                    cy["phase"] = "wait_cross"
+                    continue
+                returned = (c.low <= level) if long else (c.high >= level)
+                if returned:
+                    cy["phase"] = "wait_confirm"
+                    cy["ext"] = c.low if long else c.high
+                    adds.append(f"{side}: returned to {level:.1f}, awaiting confirming close")
+            elif ph == "wait_confirm":
+                cy["since_cross"] += 1
+                cy["ext"] = min(cy["ext"], c.low) if long else max(cy["ext"], c.high)
+                if cy["since_cross"] > self.pullback_validity:
+                    cy["phase"] = "wait_cross"
+                    continue
+                confirmed = (c.close > level) if long else (c.close < level)
+                if confirmed:
+                    entry = c.close
+                    sl = cy["ext"]
+                    risk = (entry - sl) if long else (sl - entry)
+                    if risk <= 0:
+                        cy["phase"] = "wait_cross"
+                        continue
+                    clamp = ""
+                    if risk > self.max_risk_points:
+                        sl = (entry - self.max_risk_points) if long else (entry + self.max_risk_points)
+                        risk = self.max_risk_points
+                        clamp = " (stop clamped to cap)"
+                    # reset BOTH sides; one position at a time
+                    self._cycles["LONG"] = {"phase": "wait_cross", "ext": None, "since_cross": 0}
+                    self._cycles["SHORT"] = {"phase": "wait_cross", "ext": None, "since_cross": 0}
+                    if adds:
+                        note = (note + " | " if note else "") + " | ".join(adds)
+                    note = (note + " | " if note else "") + \
+                        f"{side}: confirming close beyond {level:.1f} -> ENTER{clamp}"
+                    return self._enter(side, entry, sl, risk)
+        if adds:
+            note = (note + " | " if note else "") + " | ".join(adds)
+        return StrategyEvent(Signal.NONE, c.close, note=note)
+
+    def _enter(self, side, entry, sl, risk):
+        self.state = "IN_POSITION"
+        self.direction = side
+        self.entry_price = entry
+        self.stop_loss = sl
+        self._risk = risk
+        self._scaled = False
+        self._booked_lots = 0
+        self._booked_price = None
+        self._lots = self.num_lots
+        if side == "LONG":
+            self.target = entry + self.risk_reward * risk
+            return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl, target=self.target)
+        self.target = entry - self.risk_reward * risk
+        return StrategyEvent(Signal.ENTER_SHORT_PE, entry, stop_loss=sl, target=self.target)
+
+    # -- management -------------------------------------------------------
+    def _manage(self, c: Candle, note) -> StrategyEvent:
+        long = self.direction == "LONG"
+        R = self._risk
+        entry = self.entry_price
+
+        hit_stop = (c.low <= self.stop_loss) if long else (c.high >= self.stop_loss)
+        if hit_stop:
+            return self._finish(self.stop_loss,
+                                ExitReason.BE_STOP if self._scaled else ExitReason.STOP_LOSS)
+
+        hit_tgt = (c.high >= self.target) if long else (c.low <= self.target)
+        if not self._scaled:
+            if hit_tgt:
+                if self._lots > 1:
+                    # book 50% at the 2R target, run the rest
+                    self._scaled = True
+                    self._booked_lots = self._lots // 2
+                    self._booked_price = self.target
+                    self.stop_loss = entry + R if long else entry - R          # runner stop -> +1R
+                    self.target = self.target + self.risk_reward * R if long \
+                        else self.target - self.risk_reward * R                # runner -> +4R
+                    note = (note + " | " if note else "") + \
+                        (f"2R hit: booked {self._booked_lots} lot(s) @ {self._booked_price:.1f}, "
+                         f"runner SL->{self.stop_loss:.1f} target->{self.target:.1f}")
+                    return StrategyEvent(Signal.NONE, c.close, stop_loss=self.stop_loss,
+                                         target=self.target, note=note)
+                # single lot: take the full 2R
+                return self._finish(self.target, ExitReason.TARGET_HIT)
+        else:
+            if hit_tgt:   # runner reached 4R
+                return self._finish(self.target, ExitReason.TARGET_HIT)
+        return StrategyEvent(Signal.NONE, c.close, note=note)
+
+    def _finish(self, price, reason) -> StrategyEvent:
+        """Exit the remaining position. If a partial was booked, report the
+        blended per-unit exit so points x total-lots is the true P&L."""
+        long = self.direction == "LONG"
+        entry = self.entry_price
+        if self._booked_lots:
+            remaining = self._lots - self._booked_lots
+            booked_move = (self._booked_price - entry) if long else (entry - self._booked_price)
+            final_move = (price - entry) if long else (entry - price)
+            blended = (self._booked_lots * booked_move + remaining * final_move) / self._lots
+            eff_price = entry + blended if long else entry - blended
+        else:
+            eff_price = price
+        self._reset_position()
+        return StrategyEvent(Signal.EXIT, eff_price, reason=reason)
+
+    def force_exit(self, price, reason: ExitReason = ExitReason.FORCED_EOD) -> StrategyEvent:
+        if price is not None and self._booked_lots and self.entry_price is not None:
+            return self._finish(price, reason)
+        self._reset_position()
+        return StrategyEvent(Signal.EXIT, price, reason=reason)

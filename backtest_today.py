@@ -26,7 +26,8 @@ from datetime import datetime, time as dtime, timedelta
 import config
 from angel_api import AngelBrokingClient
 from quant_strategy import RegimeAdaptiveStrategy
-from strategy import Candle, ExitReason, Signal, SmaCrossOptionStrategy, OpeningRangeBreakout
+from strategy import (Candle, ExitReason, Signal, SmaCrossOptionStrategy,
+                      OpeningRangeBreakout, PullbackConfirmStrategy)
 
 NO_ENTRY_AFTER = dtime(*config.NO_ENTRY_AFTER_HOUR_MINUTE)
 SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
@@ -47,6 +48,11 @@ STRATEGIES = {
         retest_stop_lookback=config.ORB_RETEST_STOP_LOOKBACK),
         config.ORB_CANDLE_INTERVAL),
     "REGIME": (lambda: RegimeAdaptiveStrategy(), config.CANDLE_INTERVAL),
+    "PULLBACK": (lambda: PullbackConfirmStrategy(
+        or_minutes=config.PB_OR_MINUTES, risk_reward=config.PB_RISK_REWARD,
+        max_risk_points=config.PB_MAX_RISK_POINTS, num_lots=config.PB_NUM_LOTS,
+        pullback_validity=config.PB_PULLBACK_VALIDITY),
+        config.PB_CANDLE_INTERVAL),
 }
 
 _INTERVAL_LABEL = {"ONE_MINUTE": "1m", "THREE_MINUTE": "3m", "FIVE_MINUTE": "5m",
@@ -103,7 +109,9 @@ def replay_day(day_candles, warmup, factory):
 
         if event.note and event.signal not in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) \
                 and any(k in event.note for k in ("OR ", "skipped", "level shift",
-                                                  "retest", "SL->entry", "R reached")):
+                                                  "retest", "SL->entry", "R reached",
+                                                  "marked range", "crossed", "returned",
+                                                  "confirming", "2R hit")):
             diag.append(f"{candle.timestamp:%H:%M} {event.note}")
 
         if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE):

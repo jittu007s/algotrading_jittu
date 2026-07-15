@@ -18,10 +18,16 @@ import config
 from angel_api import AngelBrokingClient
 from instruments import find_atm_option, load_scrip_master
 from quant_strategy import RegimeAdaptiveStrategy
-from strategy import Candle, OpeningRangeBreakout, Signal, SmaCrossOptionStrategy
+from strategy import (Candle, OpeningRangeBreakout, PullbackConfirmStrategy,
+                      Signal, SmaCrossOptionStrategy)
 
 
 def build_strategy():
+    if config.STRATEGY == "PULLBACK":
+        return PullbackConfirmStrategy(
+            or_minutes=config.PB_OR_MINUTES, risk_reward=config.PB_RISK_REWARD,
+            max_risk_points=config.PB_MAX_RISK_POINTS, num_lots=config.PB_NUM_LOTS,
+            pullback_validity=config.PB_PULLBACK_VALIDITY)
     if config.STRATEGY == "ORB":
         return OpeningRangeBreakout(
             risk_reward=config.RISK_REWARD,
@@ -39,7 +45,11 @@ def build_strategy():
 
 def active_interval():
     """Each strategy runs on its own candle timeframe."""
-    return config.ORB_CANDLE_INTERVAL if config.STRATEGY == "ORB" else config.CANDLE_INTERVAL
+    if config.STRATEGY == "PULLBACK":
+        return config.PB_CANDLE_INTERVAL
+    if config.STRATEGY == "ORB":
+        return config.ORB_CANDLE_INTERVAL
+    return config.CANDLE_INTERVAL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("bot")
