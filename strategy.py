@@ -93,7 +93,7 @@ class SmaCrossOptionStrategy:
         history_len = max(200, sma_period + 5)
         self._candles = deque(maxlen=history_len)
         self._sma_history = deque(maxlen=history_len)
-        self._seed_closes = []    # first `sma_period` closes seed the SMMA
+        self._seed_closes = []   # first `sma_period` closes seed the SMMA
         self._smma = None
 
         # Fresh-cross tracking: a long setup needs a close below the SMMA
@@ -102,20 +102,20 @@ class SmaCrossOptionStrategy:
         self._seen_close_below = False
         self._seen_close_above = False
 
-        self.state = "IDLE"           # IDLE -> ARMED -> IN_POSITION
-        self.direction = None         # "LONG" or "SHORT" while ARMED / IN_POSITION
+        self.state = "IDLE"       # IDLE -> ARMED -> IN_POSITION
+        self.direction = None      # "LONG" or "SHORT" while ARMED / IN_POSITION
         self.trigger_level = None  # high (long) / low (short) of the 2nd setup candle
 
         self.entry_price = None
         self.stop_loss = None
         self.target = None
-        self.trailing = False    # True once the 1:2 level was reached
-        self._risk = None         # per-trade risk (|entry - initial SL|)
-        self.extreme_since_entry = None   # highest high (long) / lowest low (short)
+        self.trailing = False   # True once the 1:2 level was reached
+        self._risk = None       # per-trade risk (|entry - initial SL|)
+        self.extreme_since_entry = None  # highest high (long) / lowest low (short)
         self.sma_touch_count = 0
         self._currently_touching_sma = False
 
-    # -------- SMA computation -----------------
+    # ------------------------------------------------------------------
     def _update_smma(self, close):
         """SMMA / RMA: seeded with the simple mean of the first `period`
         closes, then smma = (prev * (period - 1) + close) / period."""
@@ -127,13 +127,13 @@ class SmaCrossOptionStrategy:
             self._smma = (self._smma * (self.sma_period - 1) + close) / self.sma_period
         return self._smma
 
-    # -------- Main logic -----------------
+    # ------------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
         sma = self._update_smma(candle.close)
         self._candles.append(candle)
         self._sma_history.append(sma)
 
-        # Track which side of the SMA closes land on, in every state, so a
+        # Track which side of the SMMA closes land on, in every state, so a
         # cross that happens mid-trade still validates the next setup.
         if sma is not None:
             if candle.close < sma:
@@ -152,7 +152,7 @@ class SmaCrossOptionStrategy:
             return StrategyEvent(Signal.NONE, candle.close)
 
         prev_candle = self._candles[-2]
-        prev_sma = self._sma_history[-2] if len(self._sma_history) > 1 else None
+        prev_sma = self._sma_history[-2]
         if prev_sma is None:
             return StrategyEvent(Signal.NONE, candle.close)
 
@@ -160,59 +160,73 @@ class SmaCrossOptionStrategy:
                 and self._seen_close_below):
             self.state = "ARMED"
             self.direction = "LONG"
-            self.trigger_level = candle.high  # high of the 2nd candle
-            self._seen_close_below = False
-            return StrategyEvent(Signal.NONE, candle.close)
+            self.trigger_level = candle.high  # high of the 2nd (latest) candle
+            self._seen_close_below = False    # consume the cross
         elif (prev_candle.close < prev_sma and candle.close < sma
-              and self._seen_close_above):
+                and self._seen_close_above):
             self.state = "ARMED"
             self.direction = "SHORT"
-            self.trigger_level = candle.low  # low of the 2nd candle
+            self.trigger_level = candle.low   # low of the 2nd (latest) candle
             self._seen_close_above = False
-            return StrategyEvent(Signal.NONE, candle.close)
 
         return StrategyEvent(Signal.NONE, candle.close)
 
     def _process_armed(self, candle, sma):
-        if self.direction == "LONG":
-            if candle.high >= self.trigger_level:
-                self.entry_price = self.trigger_level
-                self.stop_loss = self._candles[-2].low
-                self._risk = self.entry_price - self.stop_loss
-                if self._risk <= 0:
-                    self._risk = self.entry_price * 0.005
-                    self.stop_loss = self.entry_price - self._risk
-                self.target = self.entry_price + self.risk_reward * self._risk
-                self.extreme_since_entry = candle.high
-                self.sma_touch_count = 0
-                self._currently_touching_sma = False
-                self.state = "IN_POSITION"
-                self.trailing = False
-                return StrategyEvent(Signal.ENTER_LONG_CE, self.entry_price,
-                                   stop_loss=self.stop_loss, target=self.target)
-        elif self.direction == "SHORT":
-            if candle.low <= self.trigger_level:
-                self.entry_price = self.trigger_level
-                self.stop_loss = self._candles[-2].high
-                self._risk = self.stop_loss - self.entry_price
-                if self._risk <= 0:
-                    self._risk = self.entry_price * 0.005
-                    self.stop_loss = self.entry_price + self._risk
-                self.target = self.entry_price - self.risk_reward * self._risk
-                self.extreme_since_entry = candle.low
-                self.sma_touch_count = 0
-                self._currently_touching_sma = False
-                self.state = "IN_POSITION"
-                self.trailing = False
-                return StrategyEvent(Signal.ENTER_SHORT_PE, self.entry_price,
-                                   stop_loss=self.stop_loss, target=self.target)
+        # Setup invalidated if price closes back across the SMA before triggering.
+        crossed_back = (
+            sma is not None
+            and ((self.direction == "LONG" and candle.close < sma)
+                 or (self.direction == "SHORT" and candle.close > sma))
+        )
+        if crossed_back:
+            self._reset()
+            # The invalidating candle may itself start an opposite setup.
+            return self._process_idle(candle, sma)
 
-        return StrategyEvent(Signal.NONE, candle.close)
+        triggered = (
+            (self.direction == "LONG" and candle.high >= self.trigger_level)
+            or (self.direction == "SHORT" and candle.low <= self.trigger_level)
+        )
+        if not triggered:
+            return StrategyEvent(Signal.NONE, candle.close)
+
+        entry_price = self.trigger_level
+        prev_candle = self._candles[-2]  # candle immediately before the entry candle
+
+        if self.direction == "LONG":
+            sl = entry_price - 30
+            risk = entry_price - sl
+            if risk <= 0:
+                risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
+                sl = entry_price - risk
+            target = entry_price + self.risk_reward * risk
+            signal = Signal.ENTER_LONG_CE
+            self.extreme_since_entry = candle.high
+        else:
+            sl = entry_price + 30
+            risk = sl - entry_price
+            if risk <= 0:
+                risk = entry_price * 0.005
+                sl = entry_price + risk
+            target = entry_price - self.risk_reward * risk
+            signal = Signal.ENTER_SHORT_PE
+            self.extreme_since_entry = candle.low
+
+        self.state = "IN_POSITION"
+        self.entry_price = entry_price
+        self.stop_loss = sl
+        self.target = target
+        self.trailing = False
+        self._risk = risk
+        self.sma_touch_count = 0
+        self._currently_touching_sma = False
+
+        return StrategyEvent(signal, entry_price, stop_loss=sl, target=target)
 
     def _process_in_position(self, candle, sma):
         long = self.direction == "LONG"
 
-        # 1. Stop check
+        # 1. Stop check against the stop as it stood BEFORE this candle.
         hit_sl = candle.low <= self.stop_loss if long else candle.high >= self.stop_loss
         if hit_sl:
             exit_price = self.stop_loss
@@ -225,13 +239,12 @@ class SmaCrossOptionStrategy:
         self.extreme_since_entry = max(self.extreme_since_entry, candle.high) if long \
             else min(self.extreme_since_entry, candle.low)
 
-        # 2. Reaching the 1:2 level switches to trailing instead of exiting
+        # 2. Reaching the 1:2 level switches to trailing instead of exiting:
+        #    lock at least +/-1R, then ratchet the stop along the SMMA.
         if not self.trailing:
-            # FIX: Added None check for self.target before comparison
-            hit_target = (candle.high >= self.target) if long else (candle.low <= self.target) \
-                if self.target is not None else False
+            hit_target = candle.high >= self.target if long else candle.low <= self.target
             if hit_target:
-                self.trailing = False
+                self.trailing = True
                 if long:
                     lock = self.entry_price + self._risk
                     self.stop_loss = max(self.stop_loss, lock, sma if sma is not None else lock)
@@ -239,22 +252,23 @@ class SmaCrossOptionStrategy:
                     lock = self.entry_price - self._risk
                     self.stop_loss = min(self.stop_loss, lock, sma if sma is not None else lock)
                 self.target = None
-                return StrategyEvent(Signal.NONE, candle.close, 
-                                   stop_loss=self.stop_loss, note="target_reached")
+                return StrategyEvent(Signal.NONE, candle.close,
+                                     stop_loss=self.stop_loss, note="trailing_activated")
         else:
             if sma is not None:
                 self.stop_loss = max(self.stop_loss, sma) if long else min(self.stop_loss, sma)
 
-        # 3. Double-SMA-touch early exit
+        # 3. Double-SMMA-touch early exit applies only before the trade
+        #    earns trailing mode (afterwards the trailed stop handles exits).
         if not self.trailing:
             touching = sma is not None and candle.low <= sma <= candle.high
             if not made_new_extreme and touching and not self._currently_touching_sma:
                 self.sma_touch_count += 1
                 self._currently_touching_sma = True
                 if self.sma_touch_count >= 2:
+                    exit_price = candle.close
                     self._reset()
-                    return StrategyEvent(Signal.EXIT, candle.close,
-                                       reason=ExitReason.SMA_DOUBLE_TOUCH)
+                    return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
             elif not touching:
                 self._currently_touching_sma = False
 
@@ -290,9 +304,9 @@ class OpeningRangeBreakout:
       - After a LONG stop-out, the long trigger level becomes the DAY's
         high so far (mirror for shorts) - re-entry must beat it.
       - Once BOTH sides have stopped out, any further entry requires a
-        touch of the (updated) OR high/low, then a retracemente of at
+        touch of the (updated) OR high/low, then a retracement of at
         least `retrace_points`, then a retest of the same level. The
-        retest entry's stop is the retracemente extreme.
+        retest entry's stop is the retracement extreme.
 
     MANAGEMENT (rr_shift, per spec)
       - At `risk_reward` x risk (2R): SL shifts to the ENTRY price, the
@@ -325,7 +339,7 @@ class OpeningRangeBreakout:
         self._reset_session()
         self._reset_position()
 
-    # -- state resets ---------
+    # -- state resets -----------------------------------------------------
     def _reset_session(self):
         self._or_high = None
         self._or_low = None
@@ -354,9 +368,9 @@ class OpeningRangeBreakout:
         self._shift_t = None
         self._entry_t = None
         self._from_retest = False
-        self.trailing = False  # kept for interface compatibility
+        self.trailing = False   # kept for interface compatibility
 
-    # -- main ---------
+    # -- main --------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
         from datetime import timedelta
 
@@ -405,7 +419,7 @@ class OpeningRangeBreakout:
         self._prev = candle
         return ev
 
-    # -- entries ---------
+    # -- entries -----------------------------------------------------------
     def _entries(self, c: Candle, note):
         if self._long_done and self._short_done:
             return StrategyEvent(Signal.NONE, c.close, note=note)
@@ -427,7 +441,7 @@ class OpeningRangeBreakout:
         """Both sides stopped. The day extreme that a side's stop-out set was
         already hit (that is how it became the extreme), so price is already
         retracing AWAY from it. Each side therefore only needs two things:
-        (a) a genuine retracemente of >= retrace_points away from the level,
+        (a) a genuine retracement of >= retrace_points away from the level,
         then (b) a break back THROUGH the level in the trade direction ->
         enter. The stop is the recent swing extreme (last N candles), not the
         whole session's extreme, so a break hours after a big rally still
@@ -440,7 +454,7 @@ class OpeningRangeBreakout:
             level = self._or_high if long else self._or_low
             cy = self._cycles[side]
 
-            # furthest retracemente away from the level since the cycle began
+            # furthest retracement away from the level since the cycle began
             cur = c.low if long else c.high
             cy["extreme"] = cur if cy["extreme"] is None else (
                 min(cy["extreme"], c.low) if long else max(cy["extreme"], c.high))
@@ -451,7 +465,7 @@ class OpeningRangeBreakout:
                 continue
             if retrace < self.retrace_points:
                 # touched the level again but never pulled far enough away -
-                # not a retest; reset the retracemente anchor and keep waiting
+                # not a retest; reset the retracement anchor and keep waiting
                 cy["extreme"] = None
                 continue
 
@@ -459,7 +473,7 @@ class OpeningRangeBreakout:
             # recent swing high). On a clean monotone move the "recent swing"
             # can be far, so CLAMP the stop to max_risk_points rather than
             # skip - the retest entry always fires on a valid break-after-
-            # retracemente, with risk bounded to the cap.
+            # retracement, with risk bounded to the cap.
             window = list(self._recent)[-self.retest_stop_lookback:] or [c]
             sl = min(w.low for w in window) if long else max(w.high for w in window)
             if abs(level - sl) > self.max_risk_points:
@@ -467,7 +481,7 @@ class OpeningRangeBreakout:
                 clamp = " (stop clamped to cap)"
             else:
                 clamp = ""
-            cy["extreme"] = None    # re-arm this side for a future cycle
+            cy["extreme"] = None   # re-arm this side for a future cycle
             note = (note + " | " if note else "") + \
                 f"retest[{side}] break of {level:.1f} after {retrace:.0f}-pt retrace{clamp}"
             return self._enter(side, level, sl, c, note, from_retest=True)
@@ -503,7 +517,7 @@ class OpeningRangeBreakout:
             note = (note + " | " if note else "") + "retest entry"
         return StrategyEvent(sig, entry_price, stop_loss=sl, target=self.target, note=note)
 
-    # -- management (rr_shift + 30-min BE guard) ---------
+    # -- management (rr_shift + 30-min BE guard) ----------------------------
     def _manage(self, c: Candle) -> StrategyEvent:
         from datetime import timedelta
         long = self.direction == "LONG"
@@ -540,15 +554,15 @@ class OpeningRangeBreakout:
                             f"{self.risk_reward:g}R: SL->entry {self.stop_loss:.1f}")
 
         if self._shifted:
-            tgt = self.target
-            if (c.high >= tgt) if long else (c.low <= tgt):
-                price = tgt
+            hit_tgt = c.high >= self.target if long else c.low <= self.target
+            if hit_tgt:
+                price = self.target
                 self._capture_exit_context()
                 self._reset_position()
                 return StrategyEvent(Signal.EXIT, price, reason=ExitReason.TARGET_3R)
-            elif c.timestamp >= self._shift_t + timedelta(minutes=self.timeout_minutes):
+            if c.timestamp >= self._shift_t + timedelta(minutes=self.timeout_minutes):
                 lvl = (self._prev.high if long else self._prev.low) if self._prev else c.close
-                touched = (c.high >= lvl) if long else (c.low <= lvl)
+                touched = c.high >= lvl if long else c.low <= lvl
                 price = lvl if touched else c.close
                 self._capture_exit_context()
                 self._reset_position()
@@ -563,7 +577,7 @@ class OpeningRangeBreakout:
     def _after_exit(self, reason) -> str:
         """Book-keeping after our own exit: level shifts and side flags.
         Any stop (initial or breakeven) re-arms the side with the day's
-        extreme as it its new level; a win retires the side (or, for a
+        extreme as its new level; a win retires the side (or, for a
         retest-cycle win, the whole day)."""
         note = ""
         stopped = reason in (ExitReason.STOP_LOSS, ExitReason.BE_STOP)
@@ -620,8 +634,8 @@ class PullbackConfirmStrategy:
       - The stop then TRAILS to the 2nd-last candle's low (long) / high
         (short), ratcheting only in favour.
       - At 2R a >1-lot position books 50% and floors the runner at +1R.
-      - The trade runs until the trailing stop is hit or the 10R cap
-        (`target_cap_r`), whichever comes first.
+      - The trade runs until the trailing stop is hit or price reaches the
+        10R cap (target_cap_r), whichever comes first.
 
     Both sides are armed against the frozen levels; only one position is
     open at a time. After any exit both sides reset to wait_cross, so a new
@@ -632,18 +646,18 @@ class PullbackConfirmStrategy:
                  max_risk_points: float = 60.0, num_lots: int = 1,
                  pullback_validity: int = 20, target_cap_r: float = 10.0):
         self.or_minutes = or_minutes
-        self.risk_reward = risk_reward           # initial reward multiple (2 = 1:2)
+        self.risk_reward = risk_reward          # initial reward multiple (2 = 1:2)
         self.max_risk_points = max_risk_points
         self.num_lots = num_lots
         self.pullback_validity = pullback_validity
-        self.target_cap_r = target_cap_r         # trail until this R multiple, then exit
-        self._prev = None                         # previous closed candle (for the trail)
+        self.target_cap_r = target_cap_r        # trail until this R multiple, then exit
+        self._prev = None                       # previous closed candle (for the trail)
 
         self._session = None
         self._reset_session()
         self._reset_position()
 
-    # -- resets --
+    # -- resets -----------------------------------------------------------
     def _reset_session(self):
         self._hi = None
         self._lo = None
@@ -667,9 +681,9 @@ class PullbackConfirmStrategy:
         self._lots = self.num_lots
         self.trailing = False   # interface compatibility
 
-    # -- main --
+    # -- main -------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
-        prev = self._prev  # the candle BEFORE this one (the "2nd last")
+        prev = self._prev            # the candle BEFORE this one (the "2nd last")
         self._prev = candle
         day = candle.timestamp.date()
         if day != self._session:
@@ -697,7 +711,7 @@ class PullbackConfirmStrategy:
             return self._manage(candle, prev, note)
         return self._scan(candle, note)
 
-    # -- entry state machine --
+    # -- entry state machine ---------------------------------------------
     def _scan(self, c: Candle, note):
         adds = []
         for side in ("LONG", "SHORT"):
@@ -710,7 +724,7 @@ class PullbackConfirmStrategy:
                 if (c.high > level) if long else (c.low < level):
                     cy["phase"] = "wait_return"
                     cy["since_cross"] = 0
-                    adds.append(f"{side}: crossed {level:.1f} (1st cross ignored, await return)")
+                    adds.append(f"{side}: crossed {level:.1f} (1st cross ignored, awaiting return)")
             elif ph == "wait_return":
                 cy["since_cross"] += 1
                 if cy["since_cross"] > self.pullback_validity:
@@ -723,14 +737,14 @@ class PullbackConfirmStrategy:
                     adds.append(f"{side}: returned to {level:.1f}, awaiting confirming close")
             elif ph == "wait_confirm":
                 cy["since_cross"] += 1
+                cy["ext"] = min(cy["ext"], c.low) if long else max(cy["ext"], c.high)
                 if cy["since_cross"] > self.pullback_validity:
                     cy["phase"] = "wait_cross"
                     continue
-                cy["ext"] = min(cy["ext"], c.low) if long else max(cy["ext"], c.high)
                 confirmed = (c.close > level) if long else (c.close < level)
                 if confirmed:
                     entry = c.close
-                    sl = (self._hi + self._lo) / 2.0    # midpoint of the marked range
+                    sl = (self._hi + self._lo) / 2.0   # midpoint of the marked range
                     risk = (entry - sl) if long else (sl - entry)
                     if risk <= 0:
                         cy["phase"] = "wait_cross"
@@ -768,7 +782,7 @@ class PullbackConfirmStrategy:
         self.target = entry - self.risk_reward * risk
         return StrategyEvent(Signal.ENTER_SHORT_PE, entry, stop_loss=sl, target=self.target)
 
-    # -- management --
+    # -- management -------------------------------------------------------
     def _manage(self, c: Candle, prev: Candle, note) -> StrategyEvent:
         long = self.direction == "LONG"
         R = self._risk
@@ -779,8 +793,7 @@ class PullbackConfirmStrategy:
         if hit_stop:
             reason = ExitReason.TRAILING_STOP if self._trail_active else \
                 (ExitReason.BE_STOP if self._scaled else ExitReason.STOP_LOSS)
-            price = self.stop_loss
-            return self._finish(price, reason)
+            return self._finish(self.stop_loss, reason)
 
         # 2) 10R hard cap -> take profit
         cap = entry + self.target_cap_r * R if long else entry - self.target_cap_r * R
@@ -797,12 +810,10 @@ class PullbackConfirmStrategy:
                 self._booked_price = entry + self.risk_reward * R if long \
                     else entry - self.risk_reward * R
                 floor = entry + R if long else entry - R
-                self.stop_loss = max(self.stop_loss, floor) if long \
-                    else min(self.stop_loss, floor)
-                self._lots = self._lots - self._booked_lots
+                self.stop_loss = max(self.stop_loss, floor) if long else min(self.stop_loss, floor)
                 note = (note + " | " if note else "") + \
                     (f"2R hit: booked {self._booked_lots} lot(s) @ {self._booked_price:.1f}, "
-                     f"runner trails to 2nd-last-candle {('low' if long else 'high')} (cap 10R)")
+                     f"runner trails to 2nd-last-candle {'low' if long else 'high'} (cap 10R)")
 
         # 4) trail the stop to the 2nd-last candle's low (long) / high (short),
         #    ratcheting only in favour - runs until stop-out or the 10R cap
@@ -851,14 +862,14 @@ class FVGRetestStrategy:
       - SELL: prior candle high was below the gap, current candle's high
         re-enters the gap -> short at the gap's near (lower) edge, stop
         just above the gap high.
-      - BUY: mirror (price dips back in from above).
+      - BUY: mirror (price dips back into the gap from above).
 
     A gap is retired once used, once price closes fully through its far
     side (invalidated), or after `fvg_max_age` candles. Management: initial
     1:2, then trail the stop to the 2nd-last candle's extreme up to
     `target_cap_r` (so winners run for big gains).
 
-    Interace-compatible with the other strategies (on_closed_candle,
+    Interface-compatible with the other strategies (on_closed_candle,
     force_exit, state/direction/entry_price/stop_loss/target).
     """
 
@@ -876,9 +887,9 @@ class FVGRetestStrategy:
 
         self._session = None
         self._recent = deque(maxlen=3)   # last 3 candles for FVG detection
-        self._i = -1                      # running candle index
-        self._prev = None                 # previous candle (for the trail)
-        self._fvgs = []                   # live unmitigated gaps
+        self._i = -1                     # running candle index
+        self._prev = None                # previous candle (for the trail)
+        self._fvgs = []                  # live unmitigated gaps
         self._reset_position()
 
     def _reset_position(self):
@@ -892,7 +903,7 @@ class FVGRetestStrategy:
         self._trail_active = False
         self.trailing = False
 
-    # ----
+    # ------------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
         prev = self._prev
         self._prev = candle
@@ -917,15 +928,15 @@ class FVGRetestStrategy:
             return
         c1, _c2, c3 = self._recent[0], self._recent[1], self._recent[2]
         if c3.low > c1.high and (c3.low - c1.high) >= self.min_size:
-            # up-gap = a bullish FVG. Treated as a SUPPORT zone: when
-            # price rallies back UP into it, BUY (fade the gap).
-            self._fvgs.append({"dir": "BUY", "lo": c1.high, "hi": c3.low,
-                              "created": self._i, "ts": c3.timestamp})
+            # up-gap = a bullish FVG. Treated as a RESISTANCE zone: when
+            # price rallies back UP into it, SELL (fade the gap).
+            self._fvgs.append({"dir": "SELL", "lo": c1.high, "hi": c3.low,
+                               "created": self._i, "ts": c3.timestamp})
         elif c3.high < c1.low and (c1.low - c3.high) >= self.min_size:
-            # down-gap = a bearish FVG. Treated as a RESISTANCE zone: when
-            # price falls back DOWN into it, SELL (fade the gap).
-            self._fvgs.append({"dir": "SELL", "lo": c3.high, "hi": c1.low,
-                              "created": self._i, "ts": c3.timestamp})
+            # down-gap = a bearish FVG. Treated as a SUPPORT zone: when
+            # price falls back DOWN into it, BUY (fade the gap).
+            self._fvgs.append({"dir": "BUY", "lo": c3.high, "hi": c1.low,
+                               "created": self._i, "ts": c3.timestamp})
 
     def _expire_fvgs(self, c: Candle):
         alive = []
@@ -952,14 +963,14 @@ class FVGRetestStrategy:
                 if reentered and fresh:
                     entry = lo
                     sl = hi + self.buffer
-                    return self._enter("SELL", entry, sl, g)
+                    return self._enter("SHORT", entry, sl, g)
             else:  # BUY
                 reentered = c.low <= hi
                 fresh = (prev is None) or (prev.low > hi) or not self.require_fresh_reentry
                 if reentered and fresh:
                     entry = hi
                     sl = lo - self.buffer
-                    return self._enter("BUY", entry, sl, g)
+                    return self._enter("LONG", entry, sl, g)
         note = None
         if self._fvgs:
             note = "live FVGs: " + ", ".join(
@@ -972,12 +983,11 @@ class FVGRetestStrategy:
             return StrategyEvent(Signal.NONE, entry)
         clamp = ""
         if risk > self.max_risk_points:
-            sl = entry + self.max_risk_points if direction == "SELL" \
-                else entry - self.max_risk_points
+            sl = entry + self.max_risk_points if direction == "SHORT" else entry - self.max_risk_points
             risk = self.max_risk_points
             clamp = " (stop clamped)"
         if gap in self._fvgs:
-            self._fvgs.remove(gap)    # consume the gap
+            self._fvgs.remove(gap)          # consume the gap
         self.state = "IN_POSITION"
         self.direction = direction
         self.entry_price = entry
@@ -993,7 +1003,7 @@ class FVGRetestStrategy:
         return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl, target=self.target, note=note)
 
     def _manage(self, c: Candle, prev: Candle) -> StrategyEvent:
-        long = self.direction == "BUY"
+        long = self.direction == "LONG"
         R = self._risk
         entry = self.entry_price
 
