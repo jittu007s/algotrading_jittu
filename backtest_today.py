@@ -51,7 +51,8 @@ STRATEGIES = {
     "PULLBACK": (lambda: PullbackConfirmStrategy(
         or_minutes=config.PB_OR_MINUTES, risk_reward=config.PB_RISK_REWARD,
         max_risk_points=config.PB_MAX_RISK_POINTS, num_lots=config.PB_NUM_LOTS,
-        pullback_validity=config.PB_PULLBACK_VALIDITY),
+        pullback_validity=config.PB_PULLBACK_VALIDITY,
+            target_cap_r=config.PB_TARGET_CAP_R),
         config.PB_CANDLE_INTERVAL),
 }
 

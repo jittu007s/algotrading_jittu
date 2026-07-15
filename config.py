@@ -49,6 +49,7 @@ PB_RISK_REWARD = 2.0          # initial 1:2
 PB_MAX_RISK_POINTS = 60       # stop clamp
 PB_NUM_LOTS = 1               # >1 enables the 50%-at-2R scale-out with 4R runner
 PB_PULLBACK_VALIDITY = 20     # candles a cross stays valid awaiting return+confirm
+PB_TARGET_CAP_R = 10          # trail the stop until price reaches this R multiple, then exit
 PB_CANDLE_INTERVAL = "THREE_MINUTE"
 
 # --- Execution / safety --------------------------------------------------
