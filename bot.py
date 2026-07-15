@@ -18,11 +18,16 @@ import config
 from angel_api import AngelBrokingClient
 from instruments import find_atm_option, load_scrip_master
 from quant_strategy import RegimeAdaptiveStrategy
-from strategy import (Candle, OpeningRangeBreakout, PullbackConfirmStrategy,
-                      Signal, SmaCrossOptionStrategy)
+from strategy import (Candle, FVGRetestStrategy, OpeningRangeBreakout,
+                      PullbackConfirmStrategy, Signal, SmaCrossOptionStrategy)
 
 
 def build_strategy():
+    if config.STRATEGY == "FVG_RETEST":
+        return FVGRetestStrategy(
+            min_size=config.FVG_MIN_SIZE, buffer=config.FVG_BUFFER,
+            risk_reward=config.FVG_RISK_REWARD, max_risk_points=config.FVG_MAX_RISK_POINTS,
+            target_cap_r=config.FVG_TARGET_CAP_R, fvg_max_age=config.FVG_MAX_AGE)
     if config.STRATEGY == "PULLBACK":
         return PullbackConfirmStrategy(
             or_minutes=config.PB_OR_MINUTES, risk_reward=config.PB_RISK_REWARD,
@@ -46,6 +51,8 @@ def build_strategy():
 
 def active_interval():
     """Each strategy runs on its own candle timeframe."""
+    if config.STRATEGY == "FVG_RETEST":
+        return config.FVG_CANDLE_INTERVAL
     if config.STRATEGY == "PULLBACK":
         return config.PB_CANDLE_INTERVAL
     if config.STRATEGY == "ORB":

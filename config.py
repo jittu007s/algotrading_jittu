@@ -32,7 +32,7 @@ RISK_REWARD = 2.5
 
 # Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
 # "ORB" (Opening Range Breakout). backtest_today.py always compares both.
-STRATEGY = "PULLBACK"   # "PULLBACK" (mark high/low, cross->return->confirm) | "ORB" | "SMMA_CROSS" | "REGIME"
+STRATEGY = "PULLBACK"   # "PULLBACK" | "FVG_RETEST" | "ORB" | "SMMA_CROSS" | "REGIME"
 OR_MINUTES = 15             # ORB: opening range = first N minutes of the session
 ORB_MAX_RISK_POINTS = 80   # ORB: skip the trade if the range (= risk) is wider
 ORB_EXTENDED_TARGET_R = 3.0   # after 2R the target extends to this R multiple
@@ -51,6 +51,15 @@ PB_NUM_LOTS = 1               # >1 enables the 50%-at-2R scale-out with 4R runne
 PB_PULLBACK_VALIDITY = 20     # candles a cross stays valid awaiting return+confirm
 PB_TARGET_CAP_R = 10          # trail the stop until price reaches this R multiple, then exit
 PB_CANDLE_INTERVAL = "THREE_MINUTE"
+
+# --- FVG_RETEST strategy (sell into bearish FVG retest / buy into bullish) ---
+FVG_MIN_SIZE = 5.0            # ignore gaps smaller than this many points
+FVG_BUFFER = 2.0             # stop sits this far beyond the gap's far edge
+FVG_RISK_REWARD = 2.0        # 1:2 before trailing kicks in
+FVG_MAX_RISK_POINTS = 60     # stop clamp
+FVG_TARGET_CAP_R = 10        # trail winners to this R multiple, then exit
+FVG_MAX_AGE = 60             # candles a gap stays tradeable after forming
+FVG_CANDLE_INTERVAL = "THREE_MINUTE"
 
 # --- Execution / safety --------------------------------------------------
 PRODUCT_TYPE = "INTRADAY"

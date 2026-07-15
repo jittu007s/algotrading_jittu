@@ -848,3 +848,188 @@ class PullbackConfirmStrategy:
             return self._finish(price, reason)
         self._reset_position()
         return StrategyEvent(Signal.EXIT, price, reason=reason)
+
+
+class FVGRetestStrategy:
+    """Trade a RETEST of an unmitigated Fair Value Gap in the direction of
+    the impulse that created it, then trail for a large move.
+
+    A bearish FVG (down-impulse imbalance: high[i] < low[i-2]) is a SELL/PE
+    zone; a bullish FVG (up-impulse imbalance: low[i] > high[i-2]) is a
+    BUY/CE zone. The gap is armed after it forms; when price trades back
+    into it (a fresh re-entry from the far side), the trade fires:
+
+      - SELL: prior candle high was below the gap, current candle's high
+        re-enters the gap -> short at the gap's near (lower) edge, stop
+        just above the gap high.
+      - BUY: mirror (price dips back into the gap from above).
+
+    A gap is retired once used, once price closes fully through its far
+    side (invalidated), or after `fvg_max_age` candles. Management: initial
+    1:2, then trail the stop to the 2nd-last candle's extreme up to
+    `target_cap_r` (so winners run for big gains).
+
+    Interface-compatible with the other strategies (on_closed_candle,
+    force_exit, state/direction/entry_price/stop_loss/target).
+    """
+
+    def __init__(self, min_size: float = 5.0, buffer: float = 2.0,
+                 risk_reward: float = 2.0, max_risk_points: float = 60.0,
+                 target_cap_r: float = 10.0, fvg_max_age: int = 60,
+                 require_fresh_reentry: bool = True):
+        self.min_size = min_size
+        self.buffer = buffer
+        self.risk_reward = risk_reward
+        self.max_risk_points = max_risk_points
+        self.target_cap_r = target_cap_r
+        self.fvg_max_age = fvg_max_age
+        self.require_fresh_reentry = require_fresh_reentry
+
+        self._session = None
+        self._recent = deque(maxlen=3)   # last 3 candles for FVG detection
+        self._i = -1                     # running candle index
+        self._prev = None                # previous candle (for the trail)
+        self._fvgs = []                  # live unmitigated gaps
+        self._reset_position()
+
+    def _reset_position(self):
+        self.state = "IDLE"
+        self.direction = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.target = None
+        self._risk = None
+        self._scaled = False
+        self._trail_active = False
+        self.trailing = False
+
+    # ------------------------------------------------------------------
+    def on_closed_candle(self, candle: Candle) -> StrategyEvent:
+        prev = self._prev
+        self._prev = candle
+        self._i += 1
+        if candle.timestamp.date() != self._session:
+            self._session = candle.timestamp.date()
+            self._fvgs = []
+            self._recent.clear()
+            if self.state == "IN_POSITION":
+                self._reset_position()
+
+        self._recent.append(candle)
+        self._detect_fvg()
+        self._expire_fvgs(candle)
+
+        if self.state == "IN_POSITION":
+            return self._manage(candle, prev)
+        return self._scan(candle, prev)
+
+    def _detect_fvg(self):
+        if len(self._recent) < 3:
+            return
+        c1, _c2, c3 = self._recent[0], self._recent[1], self._recent[2]
+        if c3.low > c1.high and (c3.low - c1.high) >= self.min_size:
+            # bullish imbalance -> demand/BUY zone [c1.high, c3.low]
+            self._fvgs.append({"dir": "BUY", "lo": c1.high, "hi": c3.low,
+                               "created": self._i, "ts": c3.timestamp})
+        elif c3.high < c1.low and (c1.low - c3.high) >= self.min_size:
+            # bearish imbalance -> supply/SELL zone [c3.high, c1.low]
+            self._fvgs.append({"dir": "SELL", "lo": c3.high, "hi": c1.low,
+                               "created": self._i, "ts": c3.timestamp})
+
+    def _expire_fvgs(self, c: Candle):
+        alive = []
+        for g in self._fvgs:
+            if self._i - g["created"] > self.fvg_max_age:
+                continue
+            # invalidated once price closes fully through the far side
+            if g["dir"] == "SELL" and c.close > g["hi"]:
+                continue
+            if g["dir"] == "BUY" and c.close < g["lo"]:
+                continue
+            alive.append(g)
+        self._fvgs = alive
+
+    def _scan(self, c: Candle, prev) -> StrategyEvent:
+        # need the gap to have formed at least 2 candles ago before a retest
+        for g in list(self._fvgs):
+            if self._i - g["created"] < 2:
+                continue
+            lo, hi = g["lo"], g["hi"]
+            if g["dir"] == "SELL":
+                reentered = c.high >= lo
+                fresh = (prev is None) or (prev.high < lo) or not self.require_fresh_reentry
+                if reentered and fresh:
+                    entry = lo
+                    sl = hi + self.buffer
+                    return self._enter("SHORT", entry, sl, g)
+            else:  # BUY
+                reentered = c.low <= hi
+                fresh = (prev is None) or (prev.low > hi) or not self.require_fresh_reentry
+                if reentered and fresh:
+                    entry = hi
+                    sl = lo - self.buffer
+                    return self._enter("LONG", entry, sl, g)
+        note = None
+        if self._fvgs:
+            note = "live FVGs: " + ", ".join(
+                f"{g['dir']}[{g['lo']:.0f}-{g['hi']:.0f}]" for g in self._fvgs[-3:])
+        return StrategyEvent(Signal.NONE, c.close, note=note)
+
+    def _enter(self, direction, entry, sl, gap):
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return StrategyEvent(Signal.NONE, entry)
+        clamp = ""
+        if risk > self.max_risk_points:
+            sl = entry + self.max_risk_points if direction == "SHORT" else entry - self.max_risk_points
+            risk = self.max_risk_points
+            clamp = " (stop clamped)"
+        if gap in self._fvgs:
+            self._fvgs.remove(gap)          # consume the gap
+        self.state = "IN_POSITION"
+        self.direction = direction
+        self.entry_price = entry
+        self.stop_loss = sl
+        self._risk = risk
+        self._scaled = False
+        self._trail_active = False
+        note = f"FVG retest {direction} @ {entry:.1f} (gap {gap['lo']:.0f}-{gap['hi']:.0f}){clamp}"
+        if direction == "SHORT":
+            self.target = entry - self.risk_reward * risk
+            return StrategyEvent(Signal.ENTER_SHORT_PE, entry, stop_loss=sl, target=self.target, note=note)
+        self.target = entry + self.risk_reward * risk
+        return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl, target=self.target, note=note)
+
+    def _manage(self, c: Candle, prev: Candle) -> StrategyEvent:
+        long = self.direction == "LONG"
+        R = self._risk
+        entry = self.entry_price
+
+        hit_stop = (c.low <= self.stop_loss) if long else (c.high >= self.stop_loss)
+        if hit_stop:
+            reason = ExitReason.TRAILING_STOP if self._trail_active else ExitReason.STOP_LOSS
+            stop_price = self.stop_loss
+            self._reset_position()
+            return StrategyEvent(Signal.EXIT, stop_price, reason=reason)
+
+        cap = entry + self.target_cap_r * R if long else entry - self.target_cap_r * R
+        if (c.high >= cap) if long else (c.low <= cap):
+            self._reset_position()
+            return StrategyEvent(Signal.EXIT, cap, reason=ExitReason.TARGET_HIT)
+
+        # once past 1:2, start trailing to the 2nd-last candle extreme
+        past_2R = (c.high >= entry + self.risk_reward * R) if long \
+            else (c.low <= entry - self.risk_reward * R)
+        if past_2R:
+            self._scaled = True
+        if self._scaled and prev is not None:
+            trail = prev.low if long else prev.high
+            if long and trail > self.stop_loss:
+                self.stop_loss = trail; self._trail_active = True
+            elif not long and trail < self.stop_loss:
+                self.stop_loss = trail; self._trail_active = True
+        return StrategyEvent(Signal.NONE, c.close, stop_loss=self.stop_loss)
+
+    def force_exit(self, price, reason: ExitReason = ExitReason.FORCED_EOD) -> StrategyEvent:
+        self._reset_position()
+        return StrategyEvent(Signal.EXIT, price, reason=reason)

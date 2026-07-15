@@ -26,8 +26,8 @@ from datetime import datetime, time as dtime, timedelta
 import config
 from angel_api import AngelBrokingClient
 from quant_strategy import RegimeAdaptiveStrategy
-from strategy import (Candle, ExitReason, Signal, SmaCrossOptionStrategy,
-                      OpeningRangeBreakout, PullbackConfirmStrategy)
+from strategy import (Candle, ExitReason, FVGRetestStrategy, Signal,
+                      SmaCrossOptionStrategy, OpeningRangeBreakout, PullbackConfirmStrategy)
 
 NO_ENTRY_AFTER = dtime(*config.NO_ENTRY_AFTER_HOUR_MINUTE)
 SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
@@ -48,6 +48,11 @@ STRATEGIES = {
         retest_stop_lookback=config.ORB_RETEST_STOP_LOOKBACK),
         config.ORB_CANDLE_INTERVAL),
     "REGIME": (lambda: RegimeAdaptiveStrategy(), config.CANDLE_INTERVAL),
+    "FVG_RETEST": (lambda: FVGRetestStrategy(
+        min_size=config.FVG_MIN_SIZE, buffer=config.FVG_BUFFER,
+        risk_reward=config.FVG_RISK_REWARD, max_risk_points=config.FVG_MAX_RISK_POINTS,
+        target_cap_r=config.FVG_TARGET_CAP_R, fvg_max_age=config.FVG_MAX_AGE),
+        config.FVG_CANDLE_INTERVAL),
     "PULLBACK": (lambda: PullbackConfirmStrategy(
         or_minutes=config.PB_OR_MINUTES, risk_reward=config.PB_RISK_REWARD,
         max_risk_points=config.PB_MAX_RISK_POINTS, num_lots=config.PB_NUM_LOTS,
