@@ -630,13 +630,12 @@ class PullbackConfirmStrategy:
          longs; highest high for shorts), clamped to `max_risk_points`.
 
     MANAGEMENT
-      - Initial target = entry +/- 2R (RR 1:2).
-      - On reaching 2R:
-          * >1 lot: book 50% at 2R, move the runner's stop to +1R, and
-            extend the runner's target another 2R beyond the booked target
-            (entry +/- 4R).
-          * 1 lot: exit fully at 2R (a single F&O lot cannot be split).
-      - Runner exits at 4R (target) or the +1R stop.
+      - Stop = the MIDPOINT of the marked range; R = |entry - midpoint|.
+      - The stop then TRAILS to the 2nd-last candle's low (long) / high
+        (short), ratcheting only in favour.
+      - At 2R a >1-lot position books 50% and floors the runner at +1R.
+      - The trade runs until the trailing stop is hit or price reaches the
+        10R cap (target_cap_r), whichever comes first.
 
     Both sides are armed against the frozen levels; only one position is
     open at a time. After any exit both sides reset to wait_cross, so a new
@@ -645,12 +644,14 @@ class PullbackConfirmStrategy:
 
     def __init__(self, or_minutes: int = 15, risk_reward: float = 2.0,
                  max_risk_points: float = 60.0, num_lots: int = 1,
-                 pullback_validity: int = 20):
+                 pullback_validity: int = 20, target_cap_r: float = 10.0):
         self.or_minutes = or_minutes
         self.risk_reward = risk_reward          # initial reward multiple (2 = 1:2)
         self.max_risk_points = max_risk_points
         self.num_lots = num_lots
         self.pullback_validity = pullback_validity
+        self.target_cap_r = target_cap_r        # trail until this R multiple, then exit
+        self._prev = None                       # previous closed candle (for the trail)
 
         self._session = None
         self._reset_session()
@@ -674,6 +675,7 @@ class PullbackConfirmStrategy:
         self.target = None
         self._risk = None
         self._scaled = False
+        self._trail_active = False
         self._booked_lots = 0
         self._booked_price = None
         self._lots = self.num_lots
@@ -681,8 +683,11 @@ class PullbackConfirmStrategy:
 
     # -- main -------------------------------------------------------------
     def on_closed_candle(self, candle: Candle) -> StrategyEvent:
+        prev = self._prev            # the candle BEFORE this one (the "2nd last")
+        self._prev = candle
         day = candle.timestamp.date()
         if day != self._session:
+            self._prev = candle
             self._session = day
             self._reset_session()
             if self.state == "IN_POSITION":
@@ -703,7 +708,7 @@ class PullbackConfirmStrategy:
             note = f"marked range {self._lo:.1f}-{self._hi:.1f} (waiting for cross->return->confirm)"
 
         if self.state == "IN_POSITION":
-            return self._manage(candle, note)
+            return self._manage(candle, prev, note)
         return self._scan(candle, note)
 
     # -- entry state machine ---------------------------------------------
@@ -739,7 +744,7 @@ class PullbackConfirmStrategy:
                 confirmed = (c.close > level) if long else (c.close < level)
                 if confirmed:
                     entry = c.close
-                    sl = cy["ext"]
+                    sl = (self._hi + self._lo) / 2.0   # midpoint of the marked range
                     risk = (entry - sl) if long else (sl - entry)
                     if risk <= 0:
                         cy["phase"] = "wait_cross"
@@ -778,38 +783,49 @@ class PullbackConfirmStrategy:
         return StrategyEvent(Signal.ENTER_SHORT_PE, entry, stop_loss=sl, target=self.target)
 
     # -- management -------------------------------------------------------
-    def _manage(self, c: Candle, note) -> StrategyEvent:
+    def _manage(self, c: Candle, prev: Candle, note) -> StrategyEvent:
         long = self.direction == "LONG"
         R = self._risk
         entry = self.entry_price
 
+        # 1) stop check against the stop as it stood before this candle
         hit_stop = (c.low <= self.stop_loss) if long else (c.high >= self.stop_loss)
         if hit_stop:
-            return self._finish(self.stop_loss,
-                                ExitReason.BE_STOP if self._scaled else ExitReason.STOP_LOSS)
+            reason = ExitReason.TRAILING_STOP if self._trail_active else \
+                (ExitReason.BE_STOP if self._scaled else ExitReason.STOP_LOSS)
+            return self._finish(self.stop_loss, reason)
 
-        hit_tgt = (c.high >= self.target) if long else (c.low <= self.target)
-        if not self._scaled:
-            if hit_tgt:
-                if self._lots > 1:
-                    # book 50% at the 2R target, run the rest
-                    self._scaled = True
-                    self._booked_lots = self._lots // 2
-                    self._booked_price = self.target
-                    self.stop_loss = entry + R if long else entry - R          # runner stop -> +1R
-                    self.target = self.target + self.risk_reward * R if long \
-                        else self.target - self.risk_reward * R                # runner -> +4R
-                    note = (note + " | " if note else "") + \
-                        (f"2R hit: booked {self._booked_lots} lot(s) @ {self._booked_price:.1f}, "
-                         f"runner SL->{self.stop_loss:.1f} target->{self.target:.1f}")
-                    return StrategyEvent(Signal.NONE, c.close, stop_loss=self.stop_loss,
-                                         target=self.target, note=note)
-                # single lot: take the full 2R
-                return self._finish(self.target, ExitReason.TARGET_HIT)
-        else:
-            if hit_tgt:   # runner reached 4R
-                return self._finish(self.target, ExitReason.TARGET_HIT)
-        return StrategyEvent(Signal.NONE, c.close, note=note)
+        # 2) 10R hard cap -> take profit
+        cap = entry + self.target_cap_r * R if long else entry - self.target_cap_r * R
+        if (c.high >= cap) if long else (c.low <= cap):
+            return self._finish(cap, ExitReason.TARGET_HIT)
+
+        # 3) at 2R, a >1-lot position books 50% and locks +1R on the runner
+        reached_2R = (c.high >= entry + self.risk_reward * R) if long \
+            else (c.low <= entry - self.risk_reward * R)
+        if not self._scaled and reached_2R:
+            self._scaled = True
+            if self._lots > 1:
+                self._booked_lots = self._lots // 2
+                self._booked_price = entry + self.risk_reward * R if long \
+                    else entry - self.risk_reward * R
+                floor = entry + R if long else entry - R
+                self.stop_loss = max(self.stop_loss, floor) if long else min(self.stop_loss, floor)
+                note = (note + " | " if note else "") + \
+                    (f"2R hit: booked {self._booked_lots} lot(s) @ {self._booked_price:.1f}, "
+                     f"runner trails to 2nd-last-candle {'low' if long else 'high'} (cap 10R)")
+
+        # 4) trail the stop to the 2nd-last candle's low (long) / high (short),
+        #    ratcheting only in favour - runs until stop-out or the 10R cap
+        if prev is not None:
+            trail = prev.low if long else prev.high
+            if long and trail > self.stop_loss:
+                self.stop_loss = trail
+                self._trail_active = True
+            elif not long and trail < self.stop_loss:
+                self.stop_loss = trail
+                self._trail_active = True
+        return StrategyEvent(Signal.NONE, c.close, stop_loss=self.stop_loss, note=note)
 
     def _finish(self, price, reason) -> StrategyEvent:
         """Exit the remaining position. If a partial was booked, report the
