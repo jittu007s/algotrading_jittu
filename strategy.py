@@ -928,12 +928,14 @@ class FVGRetestStrategy:
             return
         c1, _c2, c3 = self._recent[0], self._recent[1], self._recent[2]
         if c3.low > c1.high and (c3.low - c1.high) >= self.min_size:
-            # bullish imbalance -> demand/BUY zone [c1.high, c3.low]
-            self._fvgs.append({"dir": "BUY", "lo": c1.high, "hi": c3.low,
+            # up-gap = a bullish FVG. Treated as a RESISTANCE zone: when
+            # price rallies back UP into it, SELL (fade the gap).
+            self._fvgs.append({"dir": "SELL", "lo": c1.high, "hi": c3.low,
                                "created": self._i, "ts": c3.timestamp})
         elif c3.high < c1.low and (c1.low - c3.high) >= self.min_size:
-            # bearish imbalance -> supply/SELL zone [c3.high, c1.low]
-            self._fvgs.append({"dir": "SELL", "lo": c3.high, "hi": c1.low,
+            # down-gap = a bearish FVG. Treated as a SUPPORT zone: when
+            # price falls back DOWN into it, BUY (fade the gap).
+            self._fvgs.append({"dir": "BUY", "lo": c3.high, "hi": c1.low,
                                "created": self._i, "ts": c3.timestamp})
 
     def _expire_fvgs(self, c: Candle):
