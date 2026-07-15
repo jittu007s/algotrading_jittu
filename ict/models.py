@@ -106,3 +106,35 @@ class PaperTrade:
     exit_spot: Optional[float] = None
     exit_reason: Optional[str] = None
     levels: dict = field(default_factory=dict)   # journalled setup levels
+
+
+@dataclass(frozen=True)
+class OrderBlock:
+    """Institutional order block: the last opposite-colour candle before an
+    impulsive displacement move that broke structure.
+
+    kind == HIGH  -> bearish OB (last bullish candle before a down-move);
+                     supply zone [low, high], we look to fade/short from it.
+    kind == LOW   -> bullish OB (last bearish candle before an up-move);
+                     demand zone [low, high], we look to buy from it.
+    """
+    kind: SwingKind
+    low: float
+    high: float
+    index: int
+    timestamp: datetime
+    displacement: float          # size of the impulse that validated it
+    mitigated: bool = False      # True once price has traded back into it
+
+    @property
+    def midpoint(self) -> float:
+        return (self.low + self.high) / 2
+
+
+@dataclass(frozen=True)
+class EqualLevel:
+    """Equal highs / equal lows - a liquidity pool of stacked stops."""
+    kind: SwingKind
+    price: float
+    count: int                   # how many swings clustered at this level
+    last_index: int
