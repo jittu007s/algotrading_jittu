@@ -349,9 +349,10 @@ class OpeningRangeBreakout:
         self._short_done = False
         self._long_stopped = False
         self._short_stopped = False
-        self._machine = None          # None | wait_touch | wait_retrace | wait_retest
-        self._machine_side = None
-        self._retrace_extreme = None
+        # per-side retest cycles (active once both sides have stopped):
+        # each side independently walks touch -> retrace -> retest, so a
+        # failed high-side cycle never blocks a low-side opportunity.
+        self._cycles = None
 
     def _reset_position(self):
         self.state = "IDLE"
@@ -419,8 +420,8 @@ class OpeningRangeBreakout:
         if self._long_done and self._short_done:
             return StrategyEvent(Signal.NONE, c.close, note=note)
 
-        if self._machine is not None:
-            return self._machine_step(c, note)
+        if self._cycles is not None:
+            return self._cycles_step(c, note)
 
         rng = self._or_high - self._or_low
         mid = self._or_low + rng / 2
@@ -432,47 +433,46 @@ class OpeningRangeBreakout:
             return self._enter("SHORT", c.close, sl, c, note)
         return StrategyEvent(Signal.NONE, c.close, note=note)
 
-    def _machine_step(self, c: Candle, note):
-        """Both sides stopped: touch -> retrace -> retest state machine."""
-        add = None
-        if self._machine == "wait_touch":
-            if c.high >= self._or_high and not self._long_done:
-                self._machine = "wait_retrace"
-                self._machine_side = "LONG"
-                self._retrace_extreme = c.low
-                add = f"retest: touched high {self._or_high:.1f}, waiting for retracement"
-            elif c.low <= self._or_low and not self._short_done:
-                self._machine = "wait_retrace"
-                self._machine_side = "SHORT"
-                self._retrace_extreme = c.high
-                add = f"retest: touched low {self._or_low:.1f}, waiting for retracement"
-        elif self._machine == "wait_retrace":
-            long = self._machine_side == "LONG"
+    def _cycles_step(self, c: Candle, note):
+        """Both sides stopped: each side independently walks its
+        touch -> retrace -> retest cycle against its current level, so the
+        strategy keeps trading all day with adjusted levels."""
+        adds = []
+        for side in ("LONG", "SHORT"):
+            if (side == "LONG" and self._long_done) or (side == "SHORT" and self._short_done):
+                continue
+            long = side == "LONG"
             level = self._or_high if long else self._or_low
-            self._retrace_extreme = min(self._retrace_extreme, c.low) if long \
-                else max(self._retrace_extreme, c.high)
-            retraced = (level - c.low >= self.retrace_points) if long \
-                else (c.high - level >= self.retrace_points)
-            if retraced:
-                self._machine = "wait_retest"
-                add = f"retest: retraced {self.retrace_points:g}+ pts, waiting for retest of {level:.1f}"
-        elif self._machine == "wait_retest":
-            long = self._machine_side == "LONG"
-            level = self._or_high if long else self._or_low
-            self._retrace_extreme = min(self._retrace_extreme, c.low) if long \
-                else max(self._retrace_extreme, c.high)
-            hit = c.high >= level if long else c.low <= level
-            if hit:
-                sl = self._retrace_extreme
-                risk = abs(level - sl)
-                self._machine = "wait_touch"   # re-arm for a future cycle
-                self._machine_side = None
-                if 0 < risk <= self.max_risk_points:
-                    return self._enter("LONG" if long else "SHORT", level, sl, c, note,
-                                       from_retest=True)
-                add = f"retest entry skipped: risk {risk:.1f} outside cap"
-        if add:
-            note = (note + " | " if note else "") + add
+            cy = self._cycles[side]
+            if cy["phase"] == "wait_touch":
+                touched = c.high >= level if long else c.low <= level
+                if touched:
+                    cy["phase"] = "wait_retrace"
+                    cy["extreme"] = c.low if long else c.high
+                    adds.append(f"retest[{side}]: touched {level:.1f}, waiting for retracement")
+            elif cy["phase"] == "wait_retrace":
+                cy["extreme"] = min(cy["extreme"], c.low) if long else max(cy["extreme"], c.high)
+                retraced = (level - c.low >= self.retrace_points) if long \
+                    else (c.high - level >= self.retrace_points)
+                if retraced:
+                    cy["phase"] = "wait_retest"
+                    adds.append(f"retest[{side}]: retraced {self.retrace_points:g}+ pts, "
+                                f"waiting for retest of {level:.1f}")
+            elif cy["phase"] == "wait_retest":
+                cy["extreme"] = min(cy["extreme"], c.low) if long else max(cy["extreme"], c.high)
+                hit = c.high >= level if long else c.low <= level
+                if hit:
+                    sl = cy["extreme"]
+                    risk = abs(level - sl)
+                    cy["phase"] = "wait_touch"   # re-arm this side for a future cycle
+                    cy["extreme"] = None
+                    if 0 < risk <= self.max_risk_points:
+                        if adds:
+                            note = (note + " | " if note else "") + " | ".join(adds)
+                        return self._enter(side, level, sl, c, note, from_retest=True)
+                    adds.append(f"retest[{side}] entry skipped: risk {risk:.1f} outside cap")
+        if adds:
+            note = (note + " | " if note else "") + " | ".join(adds)
         return StrategyEvent(Signal.NONE, c.close, note=note)
 
     def _enter(self, direction, entry_price, sl, candle, note=None, from_retest=False):
@@ -578,9 +578,14 @@ class OpeningRangeBreakout:
                 self._short_stopped = True
                 self._or_low = self._day_low
                 note = f"level shift: short trigger -> day low {self._or_low:.1f}"
-            if self._long_stopped and self._short_stopped and self._machine is None:
-                self._machine = "wait_touch"
-                note += " | both sides stopped: retest mode ON"
+            if self._long_stopped and self._short_stopped:
+                if self._cycles is None:
+                    self._cycles = {"LONG": {"phase": "wait_touch", "extreme": None},
+                                    "SHORT": {"phase": "wait_touch", "extreme": None}}
+                    note += " | both sides stopped: retest mode ON"
+                else:
+                    # the stopped side's level moved - restart only its cycle
+                    self._cycles[direction] = {"phase": "wait_touch", "extreme": None}
         else:
             if from_retest:
                 self._long_done = True
