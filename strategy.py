@@ -86,7 +86,7 @@ class StrategyEvent:
 
 
 class SmaCrossOptionStrategy:
-    def __init__(self, sma_period: int = 20, risk_reward: float = 2.0):
+    def __init__(self, sma_period: int = 18, risk_reward: float = 3.0):
         self.sma_period = sma_period
         self.risk_reward = risk_reward
 
@@ -268,7 +268,7 @@ class SmaCrossOptionStrategy:
                 if self.sma_touch_count >= 2:
                     exit_price = candle.close
                     self._reset()
-                    return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
+                    #return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
             elif not touching:
                 self._currently_touching_sma = False
 
