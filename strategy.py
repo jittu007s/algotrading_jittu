@@ -197,7 +197,7 @@ class SmaCrossOptionStrategy:
             sl = entry_price -30
             risk = entry_price - sl
             if risk <= 0:
-                risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
+                risk = entry_price * 0.2  # degenerate fallback, shouldn't normally happen
                 sl = entry_price - risk
             target = entry_price + self.risk_reward * risk
             signal = Signal.ENTER_LONG_CE
@@ -206,7 +206,7 @@ class SmaCrossOptionStrategy:
             sl = entry_price -30
             risk = sl - entry_price
             if risk <= 0:
-                risk = entry_price * 0.005
+                risk = entry_price * 0.2
                 sl = entry_price + risk
             target = entry_price - self.risk_reward * risk
             signal = Signal.ENTER_SHORT_PE
@@ -260,17 +260,17 @@ class SmaCrossOptionStrategy:
 
         # 3. Double-SMMA-touch early exit applies only before the trade
         #    earns trailing mode (afterwards the trailed stop handles exits).
-        if not self.trailing:
-            touching = sma is not None and candle.low <= sma <= candle.high
-            if not made_new_extreme and touching and not self._currently_touching_sma:
-                self.sma_touch_count += 1
-                self._currently_touching_sma = True
-                if self.sma_touch_count >= 2:
-                    exit_price = candle.close
-                    self._reset()
-                    return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
-            elif not touching:
-                self._currently_touching_sma = False
+        # if not self.trailing:
+        #     touching = sma is not None and candle.low <= sma <= candle.high
+        #     if not made_new_extreme and touching and not self._currently_touching_sma:
+        #         self.sma_touch_count += 1
+        #         self._currently_touching_sma = True
+        #         if self.sma_touch_count >= 2:
+        #             exit_price = candle.close
+        #             self._reset()
+        #             return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.SMA_DOUBLE_TOUCH)
+        #     elif not touching:
+        #         self._currently_touching_sma = False
 
         return StrategyEvent(Signal.NONE, candle.close)
 
