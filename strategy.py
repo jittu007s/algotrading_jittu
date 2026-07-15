@@ -199,7 +199,7 @@ class SmaCrossOptionStrategy:
             if risk <= 0:
                 risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
                 sl = entry_price - risk
-            target = entry_price + self.risk_reward * risk
+            target = entry_price + 60
             signal = Signal.ENTER_LONG_CE
             self.extreme_since_entry = candle.high
         else:
@@ -208,7 +208,7 @@ class SmaCrossOptionStrategy:
             if risk <= 0:
                 risk = entry_price * 0.005
                 sl = entry_price + risk
-            target = entry_price - self.risk_reward * risk
+            target = entry_price - 60
             signal = Signal.ENTER_SHORT_PE
             self.extreme_since_entry = candle.low
 
@@ -244,7 +244,7 @@ class SmaCrossOptionStrategy:
         if not self.trailing:
             hit_target = candle.high >= self.target if long else candle.low <= self.target
             if hit_target:
-                self.trailing = True
+                self.trailing = false
                 if long:
                     lock = self.entry_price + self._risk
                     self.stop_loss = max(self.stop_loss, lock, sma if sma is not None else lock)
