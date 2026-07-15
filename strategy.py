@@ -244,7 +244,7 @@ class SmaCrossOptionStrategy:
         if not self.trailing:
             hit_target = candle.high >= self.target if long else candle.low <= self.target
             if hit_target:
-                self.trailing = false
+                self.trailing = False
                 if long:
                     lock = self.entry_price + self._risk
                     self.stop_loss = max(self.stop_loss, lock, sma if sma is not None else lock)
