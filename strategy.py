@@ -16,7 +16,8 @@ Rules implemented, symmetrically for both directions (see README.md):
     1. Two consecutive *closed* candles close above the SMMA -> setup armed.
     2. Entry: a later candle's high crosses above the high of the 2nd
        (more recent) of those two candles.
-    3. Stop loss: low of the candle immediately before the entry candle.
+    3. Stop loss: low of the 3rd-last candle (the entry candle being the
+       last), giving the trade more room than the immediately-prior bar.
     4. Target level: entry + risk_reward * (entry - stop_loss). Reaching
        it does NOT close the trade - it switches to TRAILING mode: the
        stop jumps to lock at least +1R (entry + risk) and from then on
@@ -28,7 +29,7 @@ Rules implemented, symmetrically for both directions (see README.md):
 
   SHORT (buy ATM PE): the exact mirror — a fresh cross-down, two closes
   below the SMMA, entry on a break below the 2nd candle's low, stop loss
-  at the previous candle's high; on reaching the 1:2 level the stop locks
+  at the 3rd-last candle's high; on reaching the 1:2 level the stop locks
   -1R below entry and trails the SMMA downward.
 """
 
@@ -86,9 +87,14 @@ class StrategyEvent:
 
 
 class SmaCrossOptionStrategy:
-    def __init__(self, sma_period: int = 18, risk_reward: float = 3.0):
+    def __init__(self, sma_period: int = 18, risk_reward: float = 3.0,
+                 long_only: bool = False):
         self.sma_period = sma_period
         self.risk_reward = risk_reward
+        # When True, only cross-UP setups arm (used when the indicator runs
+        # on an option's OWN candles: you BUY the option on a cross-up, and
+        # never "short" it). A cross-down simply produces no setup.
+        self.long_only = long_only
 
         history_len = max(200, sma_period + 5)
         self._candles = deque(maxlen=history_len)
@@ -162,7 +168,8 @@ class SmaCrossOptionStrategy:
             self.direction = "LONG"
             self.trigger_level = candle.high  # high of the 2nd (latest) candle
             self._seen_close_below = False    # consume the cross
-        elif (prev_candle.close < prev_sma and candle.close < sma
+        elif (not self.long_only
+                and prev_candle.close < prev_sma and candle.close < sma
                 and self._seen_close_above):
             self.state = "ARMED"
             self.direction = "SHORT"
@@ -191,10 +198,13 @@ class SmaCrossOptionStrategy:
             return StrategyEvent(Signal.NONE, candle.close)
 
         entry_price = self.trigger_level
-        prev_candle = self._candles[-2]  # candle immediately before the entry candle
+        # Stop loss sits at the 3rd-last candle's extreme (the entry candle
+        # is the last one, i.e. _candles[-1]); fall back toward the entry
+        # candle if we somehow do not yet have three candles of history.
+        sl_candle = self._candles[-3] if len(self._candles) >= 3 else self._candles[-2]
 
         if self.direction == "LONG":
-            sl = entry_price - 30
+            sl = sl_candle.low
             risk = entry_price - sl
             if risk <= 0:
                 risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
@@ -203,7 +213,7 @@ class SmaCrossOptionStrategy:
             signal = Signal.ENTER_LONG_CE
             self.extreme_since_entry = candle.high
         else:
-            sl = entry_price + 30
+            sl = sl_candle.high
             risk = sl - entry_price
             if risk <= 0:
                 risk = entry_price * 0.005

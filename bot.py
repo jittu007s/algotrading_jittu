@@ -162,11 +162,186 @@ def exit_position(client, held_option, event):
         )
 
 
+# ---------------------------------------------------------------------------
+# OPTION-chart mode: run the SMMA crossover directly on the weekly-expiry ATM
+# option's OWN candles and BUY the option on a cross-up. Both the ATM CE and
+# ATM PE are watched in parallel as independent "lanes" (long-only per
+# option). The ATM strike is re-resolved from live spot whenever a lane is
+# flat, so a fresh setup always trades the current ATM; a held lane keeps its
+# option until the strategy exits it.
+# ---------------------------------------------------------------------------
+
+def build_option_strategy():
+    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD,
+                                  risk_reward=config.RISK_REWARD, long_only=True)
+
+
+class OptionLane:
+    """One option (CE or PE) tracked on its own candles with its own SMMA."""
+
+    def __init__(self, option_type):
+        self.option_type = option_type   # "CE" or "PE"
+        self.strategy = build_option_strategy()
+        self.token = None
+        self.symbol = None
+        self.lotsize = None
+        self.last_seen_ts = None
+        self.held = None   # dict{symbol,token,quantity} while a position is open
+
+    def repoint(self, option):
+        """Switch this lane to a new ATM strike and start its SMMA fresh."""
+        self.strategy = build_option_strategy()
+        self.token = option["token"]
+        self.symbol = option["symbol"]
+        self.lotsize = option["lotsize"]
+        self.last_seen_ts = None
+
+
+def latest_spot(client, interval):
+    now = datetime.now()
+    raw = client.get_candles(
+        exchange=config.UNDERLYING_EXCHANGE, symboltoken=config.UNDERLYING_TOKEN,
+        interval=interval, from_dt=now - timedelta(days=4), to_dt=now)
+    return raw[-1][4] if raw else None
+
+
+def fetch_candles_since(client, token, exchange, interval, last_seen_ts):
+    """Closed candles for `token` newer than last_seen_ts (skips the
+    still-forming bar)."""
+    now = datetime.now()
+    raw = client.get_candles(exchange=exchange, symboltoken=token, interval=interval,
+                             from_dt=now - timedelta(days=4), to_dt=now)
+    interval_s = INTERVAL_SECONDS[interval]
+    out = []
+    for row in raw:
+        ts = datetime.fromisoformat(row[0]).replace(tzinfo=None)
+        if last_seen_ts and ts <= last_seen_ts:
+            continue
+        if ts + timedelta(seconds=interval_s) > now:
+            continue
+        out.append(Candle(timestamp=ts, open=row[1], high=row[2], low=row[3], close=row[4]))
+    out.sort(key=lambda c: c.timestamp)
+    return out
+
+
+def warm_lane(client, lane, interval):
+    """Feed the new option's recent history into its SMMA (state only, no
+    orders) so a cross-up can fire without waiting for a fresh warm-up."""
+    candles = fetch_candles_since(client, lane.token, config.NFO_EXCHANGE, interval, None)
+    for c in candles:
+        lane.strategy.on_closed_candle(c)
+        lane.last_seen_ts = c.timestamp
+    if lane.strategy.state == "IN_POSITION":
+        lane.strategy.force_exit(price=None)  # a warm-up "position" was never real
+    logger.info("[%s] warmed %s on %d candles (token=%s)",
+                lane.option_type, lane.symbol, len(candles), lane.token)
+
+
+def buy_option(client, lane, event):
+    qty = lane.lotsize or config.LOT_SIZE
+    logger.info("[%s] ENTRY %s option_price=%.2f qty=%s | SL=%.2f target=%.2f",
+                lane.option_type, lane.symbol, event.price, qty,
+                event.stop_loss, event.target)
+    if not config.DRY_RUN:
+        client.place_market_order(
+            exchange=config.NFO_EXCHANGE, tradingsymbol=lane.symbol,
+            symboltoken=lane.token, transaction_type="BUY", quantity=qty,
+            producttype=config.PRODUCT_TYPE)
+    lane.held = {"symbol": lane.symbol, "token": lane.token, "quantity": qty}
+
+
+def sell_option(client, lane, event):
+    reason = event.reason.value if event.reason else "unknown"
+    price = "n/a" if event.price is None else f"{event.price:.2f}"
+    held = lane.held or {"symbol": lane.symbol, "token": lane.token,
+                         "quantity": lane.lotsize or config.LOT_SIZE}
+    logger.info("[%s] EXIT (%s) %s option_price=%s qty=%s",
+                lane.option_type, reason, held["symbol"], price, held["quantity"])
+    if not config.DRY_RUN:
+        client.place_market_order(
+            exchange=config.NFO_EXCHANGE, tradingsymbol=held["symbol"],
+            symboltoken=held["token"], transaction_type="SELL",
+            quantity=held["quantity"], producttype=config.PRODUCT_TYPE)
+
+
+def run_option_chart_loop(client, scrip_master):
+    interval = config.CANDLE_INTERVAL
+    interval_s = INTERVAL_SECONDS[interval]
+    lanes = {"CE": OptionLane("CE"), "PE": OptionLane("PE")}
+    start_time = datetime.now()
+
+    logger.info("Bot started (OPTION-chart SMMA). DRY_RUN=%s interval=%s sma=%s",
+                config.DRY_RUN, interval, config.SMA_PERIOD)
+
+    while True:
+        try:
+            now = datetime.now()
+            spot = latest_spot(client, interval)
+
+            for otype, lane in lanes.items():
+                if lane.held and is_past_square_off(now):
+                    event = lane.strategy.force_exit(price=None)
+                    sell_option(client, lane, event)
+                    lane.held = None
+                    continue
+
+                # Re-resolve the ATM strike only while the lane is flat, so a
+                # held option is never swapped out from under an open trade.
+                if lane.held is None and spot is not None:
+                    option = find_atm_option(
+                        scrip_master, spot, option_type=otype,
+                        underlying=config.UNDERLYING_NAME, strike_step=config.STRIKE_STEP)
+                    if option["token"] != lane.token:
+                        lane.repoint(option)
+                        warm_lane(client, lane, interval)
+
+                if lane.token is None:
+                    continue
+
+                for candle in fetch_candles_since(client, lane.token,
+                                                  config.NFO_EXCHANGE, interval,
+                                                  lane.last_seen_ts):
+                    lane.last_seen_ts = candle.timestamp
+                    is_live = candle.timestamp + timedelta(seconds=interval_s) > start_time
+                    event = lane.strategy.on_closed_candle(candle)
+                    if not is_live:
+                        continue   # pre-start candles warm state only
+
+                    if event.note:
+                        logger.info("[%s %s] note: %s", otype, lane.symbol, event.note)
+
+                    if event.signal == Signal.ENTER_LONG_CE and lane.held is None:
+                        if is_past_entry_cutoff(datetime.now()):
+                            lane.strategy.force_exit(price=None)
+                            logger.info("[%s] entry suppressed - past %02d:%02d cutoff",
+                                        otype, *config.NO_ENTRY_AFTER_HOUR_MINUTE)
+                        else:
+                            buy_option(client, lane, event)
+                    elif event.signal == Signal.EXIT and lane.held is not None:
+                        sell_option(client, lane, event)
+                        lane.held = None
+
+            time.sleep(seconds_until_next_candle(datetime.now()))
+
+        except Exception as exc:
+            if "rate" in str(exc).lower() or "AB1021" in str(exc) or "Too many requests" in str(exc):
+                logger.warning("Rate limited by Angel One; cooling down %ss",
+                               config.RATE_LIMIT_COOLDOWN_SECONDS)
+                time.sleep(config.RATE_LIMIT_COOLDOWN_SECONDS)
+            else:
+                logger.exception("Error in option-chart loop; retrying next candle")
+                time.sleep(seconds_until_next_candle(datetime.now()))
+
+
 def main():
     client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
     client.login()
 
     scrip_master = load_scrip_master()
+
+    if config.STRATEGY == "SMMA_CROSS" and getattr(config, "SMMA_SOURCE", "INDEX") == "OPTION":
+        run_option_chart_loop(client, scrip_master)
+        return
 
     strategy = build_strategy()
 

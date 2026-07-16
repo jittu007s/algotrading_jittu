@@ -30,6 +30,16 @@ CANDLE_INTERVAL = "THREE_MINUTE"
 SMA_PERIOD = 18   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close")
 RISK_REWARD = 2.5
 
+# Where the SMMA_CROSS strategy reads its candles:
+#   "OPTION" - run the crossover on the weekly-expiry ATM option's OWN
+#              candles and BUY the option on a cross-up. Both the ATM CE
+#              and ATM PE are watched in parallel (long-only per option);
+#              the ATM strike is re-resolved from live spot whenever a lane
+#              is flat, so a fresh setup always trades the current ATM.
+#   "INDEX"  - the original behaviour: crossover on the Nifty index chart,
+#              mapping a long setup -> ATM CE and a short setup -> ATM PE.
+SMMA_SOURCE = "OPTION"
+
 # Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
 # "ORB" (Opening Range Breakout). backtest_today.py always compares both.
 STRATEGY = "PULLBACK"   # "PULLBACK" | "FVG_RETEST" | "ORB" | "SMMA_CROSS" | "REGIME"
