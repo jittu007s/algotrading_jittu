@@ -24,6 +24,7 @@ been taken.
 """
 
 import sys
+import time
 from datetime import datetime, time as dtime, timedelta
 
 import config
@@ -36,8 +37,22 @@ NO_ENTRY_AFTER = dtime(*config.NO_ENTRY_AFTER_HOUR_MINUTE)
 SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
 INTERVAL = config.CANDLE_INTERVAL
 
+# Angel One's historical (getCandleData) endpoint is strictly rate limited.
+# The backtester fires one call per unique option strike, so we pace them to
+# stay under the limit instead of tripping it and getting banned mid-run.
+FETCH_MIN_INTERVAL = getattr(config, "BACKTEST_FETCH_MIN_INTERVAL", 1.5)
+_last_fetch = [0.0]
+
+
+def _throttle():
+    gap = time.time() - _last_fetch[0]
+    if gap < FETCH_MIN_INTERVAL:
+        time.sleep(FETCH_MIN_INTERVAL - gap)
+    _last_fetch[0] = time.time()
+
 
 def fetch_candles(client, exchange, token, from_dt, to_dt):
+    _throttle()
     raw = client.get_candles(exchange=exchange, symboltoken=token, interval=INTERVAL,
                              from_dt=from_dt, to_dt=to_dt)
     out = [Candle(timestamp=datetime.fromisoformat(r[0]).replace(tzinfo=None),
@@ -142,12 +157,25 @@ def replay_day(index_day, warmup, scrip, ic, offset, day, option_cache, client, 
         if key not in option_cache:
             frm = datetime.combine(day, dtime(9, 0))
             to = datetime.combine(day, dtime(15, 35))
-            try:
-                option_cache[key] = fetch_candles(client, ic["option_exchange"],
-                                                  option["token"], frm, to)
-            except Exception as exc:
-                option_cache[key] = []
-                skips.append((c.timestamp, otype, f"fetch failed: {exc}"))
+            cooldown = getattr(config, "RATE_LIMIT_COOLDOWN_SECONDS", 30)
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    # Only a genuine empty response (status ok, no data - e.g. an
+                    # expired strike) is cached; a rate-limit/network error is
+                    # transient and must NOT poison the cache, or every later
+                    # signal on this strike would wrongly skip as "no candles".
+                    option_cache[key] = fetch_candles(client, ic["option_exchange"],
+                                                      option["token"], frm, to)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        time.sleep(cooldown)
+            if last_exc is not None:
+                skips.append((c.timestamp, otype, f"fetch failed: {last_exc}"))
+                continue
         ocandles = option_cache[key]
         if not ocandles:
             skips.append((c.timestamp, otype, "no option candles"))

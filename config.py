@@ -153,3 +153,9 @@ FETCH_DELAY_SECONDS = 8
 # Cool-down after an AB1021 "Too many requests" response. Angel One's
 # historical endpoint has a strict quota; back off generously.
 RATE_LIMIT_COOLDOWN_SECONDS = 60
+
+# Minimum seconds between historical (getCandleData) calls in
+# backtest_option_chart.py, which fetches one strike's candles per signal.
+# Pacing them avoids tripping Angel One's rate limit mid-run. Raise this if
+# you still see "exceeding access rate"; lower it to speed up a small backtest.
+BACKTEST_FETCH_MIN_INTERVAL = 1.5
