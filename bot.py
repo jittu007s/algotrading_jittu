@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 import config
 from angel_api import AngelBrokingClient
-from instruments import find_atm_option, load_scrip_master
+from instruments import find_atm_option, find_offset_option, load_scrip_master
 from quant_strategy import RegimeAdaptiveStrategy
 from strategy import (Candle, FVGRetestStrategy, OpeningRangeBreakout,
                       PullbackConfirmStrategy, Signal, SmaCrossOptionStrategy)
@@ -333,15 +333,182 @@ def run_option_chart_loop(client, scrip_master):
                 time.sleep(seconds_until_next_candle(datetime.now()))
 
 
+# ---------------------------------------------------------------------------
+# TWO-STAGE mode (INDEX_THEN_OPTION): the SMMA crossover fires on the INDEX to
+# pick a direction; the bot then goes to the strike STRIKE_OFFSET strikes
+# OTM/ITM and only BUYs once the SAME crossover ALSO confirms on that option's
+# OWN candles. The option leg exits at +100% premium or its trailed stop
+# (initial = 3rd-last candle low, then trailed to the 2nd-last candle low).
+# ---------------------------------------------------------------------------
+
+def build_index_strategy():
+    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
+
+
+def build_option_leg_strategy():
+    return SmaCrossOptionStrategy(
+        sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD, long_only=True,
+        target_mode="premium_pct", target_premium_pct=config.OPTION_TARGET_PREMIUM_PCT,
+        trail_mode="prev2_extreme")
+
+
+def resolve_leg_option(scrip_master, spot, option_type, ic):
+    return find_offset_option(
+        scrip_master, spot, option_type=option_type, offset=config.STRIKE_OFFSET,
+        underlying=ic["name"], strike_step=ic["strike_step"],
+        option_exchange=ic["option_exchange"])
+
+
+def run_index_option_confirm_loop(client, scrip_master):
+    ic = config.index_config()
+    interval = config.CANDLE_INTERVAL
+    interval_s = INTERVAL_SECONDS[interval]
+    index_strategy = build_index_strategy()
+
+    index_last_ts = None
+    pending = None   # dict{option, otype, strat, last_ts, age} awaiting option confirm
+    held = None      # dict{symbol, token, quantity, strat, last_ts, otype}
+    start_time = datetime.now()
+
+    logger.info("Bot started (INDEX_THEN_OPTION). index=%s offset=%+d DRY_RUN=%s "
+                "interval=%s sma=%s target=+%.0f%%",
+                config.INDEX, config.STRIKE_OFFSET, config.DRY_RUN, interval,
+                config.SMA_PERIOD, config.OPTION_TARGET_PREMIUM_PCT * 100)
+
+    def option_candles(token, last_ts):
+        return fetch_candles_since(client, token, ic["option_exchange"], interval, last_ts)
+
+    while True:
+        try:
+            now = datetime.now()
+
+            # -- square-off any open option position --------------------------
+            if held and is_past_square_off(now):
+                event = held["strat"].force_exit(price=None)
+                sell_held(client, held, event)
+                held = None
+
+            # -- STAGE 2a: manage an open option position ---------------------
+            if held:
+                for candle in option_candles(held["token"], held["last_ts"]):
+                    held["last_ts"] = candle.timestamp
+                    event = held["strat"].on_closed_candle(candle)
+                    if event.note:
+                        logger.info("[%s %s] %s", held["otype"], held["symbol"], event.note)
+                    if event.signal == Signal.EXIT:
+                        sell_held(client, held, event)
+                        held = None
+                        break
+
+            # -- STAGE 2b: wait for the option chart to confirm ---------------
+            if pending and not held:
+                for candle in option_candles(pending["option"]["token"], pending["last_ts"]):
+                    pending["last_ts"] = candle.timestamp
+                    pending["age"] += 1
+                    event = pending["strat"].on_closed_candle(candle)
+                    if event.signal == Signal.ENTER_LONG_CE:
+                        if is_past_entry_cutoff(datetime.now()):
+                            pending["strat"].force_exit(price=None)
+                            logger.info("[%s] confirm suppressed - past cutoff", pending["otype"])
+                            pending = None
+                        else:
+                            held = buy_leg(client, pending, event)
+                            pending = None
+                        break
+                    if pending["age"] > config.OPTION_CONFIRM_VALIDITY:
+                        logger.info("[%s] option confirm expired (%d candles), dropping setup",
+                                    pending["otype"], pending["age"])
+                        pending = None
+                        break
+
+            # -- STAGE 1: index crossover picks a direction -------------------
+            for candle in fetch_candles_since(client, ic["under_token"],
+                                              ic["under_exchange"], interval, index_last_ts):
+                index_last_ts = candle.timestamp
+                is_live = candle.timestamp + timedelta(seconds=interval_s) > start_time
+                event = index_strategy.on_closed_candle(candle)
+                if not is_live:
+                    continue
+                if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) \
+                        and held is None:
+                    if is_past_entry_cutoff(datetime.now()):
+                        index_strategy.force_exit(price=None)
+                        continue
+                    otype = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
+                    try:
+                        option = resolve_leg_option(scrip_master, candle.close, otype, ic)
+                    except LookupError as exc:
+                        logger.warning("Could not resolve %s option: %s", otype, exc)
+                        continue
+                    strat = build_option_leg_strategy()
+                    warm_from_history(client, strat, option["token"], ic["option_exchange"], interval)
+                    pending = {"option": option, "otype": otype, "strat": strat,
+                               "last_ts": None, "age": 0}
+                    logger.info("[STAGE1] index %s @%.2f -> watch %s (strike %s) for confirm",
+                                otype, candle.close, option["symbol"], option["strike"])
+
+            time.sleep(seconds_until_next_candle(datetime.now()))
+
+        except Exception as exc:
+            if "rate" in str(exc).lower() or "AB1021" in str(exc) or "Too many requests" in str(exc):
+                logger.warning("Rate limited by Angel One; cooling down %ss",
+                               config.RATE_LIMIT_COOLDOWN_SECONDS)
+                time.sleep(config.RATE_LIMIT_COOLDOWN_SECONDS)
+            else:
+                logger.exception("Error in index-option loop; retrying next candle")
+                time.sleep(seconds_until_next_candle(datetime.now()))
+
+
+def warm_from_history(client, strat, token, exchange, interval):
+    """Feed an option's recent history into a strategy (state only) so its
+    SMMA is ready to detect a crossover immediately."""
+    for c in fetch_candles_since(client, token, exchange, interval, None):
+        strat.on_closed_candle(c)
+    if strat.state == "IN_POSITION":
+        strat.force_exit(price=None)
+
+
+def buy_leg(client, pending, event):
+    option = pending["option"]
+    qty = option["lotsize"] or config.LOT_SIZE
+    logger.info("[STAGE2] CONFIRM %s option_price=%.2f qty=%s | SL=%.2f target=%.2f (+%.0f%%)",
+                option["symbol"], event.price, qty, event.stop_loss, event.target,
+                config.OPTION_TARGET_PREMIUM_PCT * 100)
+    if not config.DRY_RUN:
+        client.place_market_order(
+            exchange=config.index_config()["option_exchange"], tradingsymbol=option["symbol"],
+            symboltoken=option["token"], transaction_type="BUY", quantity=qty,
+            producttype=config.PRODUCT_TYPE)
+    return {"symbol": option["symbol"], "token": option["token"], "quantity": qty,
+            "strat": pending["strat"], "last_ts": pending["last_ts"], "otype": pending["otype"]}
+
+
+def sell_held(client, held, event):
+    reason = event.reason.value if event.reason else "unknown"
+    price = "n/a" if event.price is None else f"{event.price:.2f}"
+    logger.info("[EXIT] (%s) %s option_price=%s qty=%s",
+                reason, held["symbol"], price, held["quantity"])
+    if not config.DRY_RUN:
+        client.place_market_order(
+            exchange=config.index_config()["option_exchange"], tradingsymbol=held["symbol"],
+            symboltoken=held["token"], transaction_type="SELL", quantity=held["quantity"],
+            producttype=config.PRODUCT_TYPE)
+
+
 def main():
     client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
     client.login()
 
     scrip_master = load_scrip_master()
 
-    if config.STRATEGY == "SMMA_CROSS" and getattr(config, "SMMA_SOURCE", "INDEX") == "OPTION":
-        run_option_chart_loop(client, scrip_master)
-        return
+    if config.STRATEGY == "SMMA_CROSS":
+        mode = getattr(config, "SMMA_SOURCE", "INDEX")
+        if mode == "INDEX_THEN_OPTION":
+            run_index_option_confirm_loop(client, scrip_master)
+            return
+        if mode == "OPTION":
+            run_option_chart_loop(client, scrip_master)
+            return
 
     strategy = build_strategy()
 

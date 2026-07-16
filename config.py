@@ -31,14 +31,50 @@ SMA_PERIOD = 18   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close"
 RISK_REWARD = 2.5
 
 # Where the SMMA_CROSS strategy reads its candles:
-#   "OPTION" - run the crossover on the weekly-expiry ATM option's OWN
-#              candles and BUY the option on a cross-up. Both the ATM CE
-#              and ATM PE are watched in parallel (long-only per option);
-#              the ATM strike is re-resolved from live spot whenever a lane
-#              is flat, so a fresh setup always trades the current ATM.
-#   "INDEX"  - the original behaviour: crossover on the Nifty index chart,
-#              mapping a long setup -> ATM CE and a short setup -> ATM PE.
-SMMA_SOURCE = "OPTION"
+#   "INDEX_THEN_OPTION" - two-stage: the crossover fires on the INDEX chart
+#              to pick a direction, then the bot goes to the strike
+#              STRIKE_OFFSET strikes OTM/ITM and only BUYs once the SAME
+#              crossover ALSO confirms on that option's OWN candles. Exit
+#              when the premium hits OPTION_TARGET_PREMIUM_PCT (+100%) or the
+#              trailed stop (2nd-last candle low; first stop = 3rd-last low).
+#   "OPTION" - run the crossover directly on the weekly ATM option's OWN
+#              candles and BUY on a cross-up (ATM CE and PE watched in
+#              parallel, long-only per option).
+#   "INDEX"  - the original behaviour: crossover on the index chart, mapping
+#              a long setup -> ATM CE and a short setup -> ATM PE.
+SMMA_SOURCE = "INDEX_THEN_OPTION"
+
+# --- Multi-index / two-stage (index signal -> offset option -> option confirm) ---
+# Which index the bot trades. Its underlying candles drive stage 1.
+INDEX = "NIFTY"            # "NIFTY" | "BANKNIFTY" | "SENSEX"
+# Strikes away from ATM for the option leg, signed towards OTM:
+#   +N -> N strikes OTM,  -N -> N strikes ITM,  0 -> ATM.
+STRIKE_OFFSET = 2
+# Candles to wait for the option-chart crossover to confirm after the index
+# signal; if it does not confirm within this many candles the setup is dropped.
+OPTION_CONFIRM_VALIDITY = 10
+# Book the whole option position when the premium gains this fraction
+# (1.0 = +100%, i.e. the premium doubles).
+OPTION_TARGET_PREMIUM_PCT = 1.0
+
+# Per-index instrument map. VERIFY tokens / strike steps / exchanges against
+# the live scrip master before trading - Angel One revises lot sizes and
+# occasionally the index tokens. Index candles are read from `under_exchange`
+# / `under_token`; options are resolved on `option_exchange` (NFO for NSE
+# indices, BFO for the BSE SENSEX).
+INDEXES = {
+    "NIFTY":     {"name": "NIFTY",     "under_exchange": "NSE", "under_token": "99926000",
+                  "option_exchange": "NFO", "strike_step": 50},
+    "BANKNIFTY": {"name": "BANKNIFTY", "under_exchange": "NSE", "under_token": "99926009",
+                  "option_exchange": "NFO", "strike_step": 100},
+    "SENSEX":    {"name": "SENSEX",    "under_exchange": "BSE", "under_token": "99919000",
+                  "option_exchange": "BFO", "strike_step": 100},
+}
+
+
+def index_config(name: str = None) -> dict:
+    """Instrument map for the active (or named) index."""
+    return INDEXES[name or INDEX]
 
 # Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
 # "ORB" (Opening Range Breakout). backtest_today.py always compares both.

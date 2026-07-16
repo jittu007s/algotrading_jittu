@@ -38,10 +38,23 @@ def _parse_expiry(raw: str) -> date:
     return datetime.strptime(raw, "%d%b%Y").date()
 
 
-def find_atm_option(scrip_master, spot_price: float, option_type: str = "CE",
-                     underlying: str = "NIFTY", strike_step: int = 50) -> dict:
-    """Return {symbol, token, expiry, strike, lotsize} for the ATM option
-    of the nearest upcoming (weekly/monthly) expiry.
+def find_offset_option(scrip_master, spot_price: float, option_type: str = "CE",
+                       offset: int = 0, underlying: str = "NIFTY",
+                       strike_step: int = 50, option_exchange: str = None,
+                       as_of: date = None) -> dict:
+    """Return {symbol, token, expiry, strike, lotsize} for the option `offset`
+    strikes away from ATM, of the nearest expiry on/after `as_of`.
+
+    `offset` is signed and measured towards out-of-the-money:
+      offset > 0  -> OTM (CE: strikes ABOVE spot; PE: strikes BELOW spot)
+      offset < 0  -> ITM (CE: strikes BELOW spot; PE: strikes ABOVE spot)
+      offset == 0 -> ATM
+    Because a CE is OTM above spot and a PE is OTM below it, the offset is
+    added for a CE and subtracted for a PE.
+
+    `option_exchange` (e.g. "NFO" for NIFTY/BANKNIFTY, "BFO" for SENSEX)
+    disambiguates instruments that share a `name` across exchanges. `as_of`
+    lets a backtest pick the expiry that was current on a past date.
 
     NOTE: field names/formats in Angel One's scrip master have changed
     across API revisions in the past - re-verify `instrumenttype`,
@@ -49,13 +62,17 @@ def find_atm_option(scrip_master, spot_price: float, option_type: str = "CE",
     stops matching anything.
     """
     atm_strike = round(spot_price / strike_step) * strike_step
-    today = date.today()
+    signed = offset if option_type == "CE" else -offset
+    target_strike = atm_strike + signed * strike_step
+    floor_date = as_of or date.today()
 
     candidates = []
     for item in scrip_master:
         if item.get("instrumenttype") != "OPTIDX":
             continue
         if item.get("name") != underlying:
+            continue
+        if option_exchange and item.get("exch_seg") != option_exchange:
             continue
         symbol = item.get("symbol", "")
         if not symbol.endswith(option_type):
@@ -65,12 +82,14 @@ def find_atm_option(scrip_master, spot_price: float, option_type: str = "CE",
             strike = float(item["strike"]) / 100  # Angel One stores strike * 100
         except (KeyError, ValueError):
             continue
-        if expiry < today or strike != atm_strike:
+        if expiry < floor_date or strike != target_strike:
             continue
         candidates.append((expiry, item, strike))
 
     if not candidates:
-        raise LookupError(f"No {option_type} option found for {underlying} ATM strike {atm_strike}")
+        raise LookupError(
+            f"No {option_type} {underlying} option at strike {target_strike} "
+            f"(ATM {atm_strike}, offset {offset}) on/after {floor_date}")
 
     candidates.sort(key=lambda c: c[0])
     expiry, item, strike = candidates[0]
@@ -81,3 +100,12 @@ def find_atm_option(scrip_master, spot_price: float, option_type: str = "CE",
         "strike": strike,
         "lotsize": int(item["lotsize"]) if item.get("lotsize") else None,
     }
+
+
+def find_atm_option(scrip_master, spot_price: float, option_type: str = "CE",
+                     underlying: str = "NIFTY", strike_step: int = 50,
+                     option_exchange: str = None) -> dict:
+    """ATM option of the nearest upcoming expiry (offset 0)."""
+    return find_offset_option(scrip_master, spot_price, option_type=option_type,
+                              offset=0, underlying=underlying,
+                              strike_step=strike_step, option_exchange=option_exchange)

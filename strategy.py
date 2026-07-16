@@ -88,13 +88,27 @@ class StrategyEvent:
 
 class SmaCrossOptionStrategy:
     def __init__(self, sma_period: int = 18, risk_reward: float = 3.0,
-                 long_only: bool = False):
+                 long_only: bool = False, target_mode: str = "rr",
+                 target_premium_pct: float = 1.0, trail_mode: str = "smma"):
         self.sma_period = sma_period
         self.risk_reward = risk_reward
         # When True, only cross-UP setups arm (used when the indicator runs
         # on an option's OWN candles: you BUY the option on a cross-up, and
         # never "short" it). A cross-down simply produces no setup.
         self.long_only = long_only
+        # target_mode:
+        #   "rr"          -> target = entry +/- risk_reward * risk (index rules)
+        #   "premium_pct" -> target = entry * (1 +/- target_premium_pct); used
+        #                    on the option leg to book when the premium gains
+        #                    e.g. 100% (target_premium_pct=1.0).
+        # trail_mode:
+        #   "smma"          -> original: lock +/-1R at target, then trail SMMA
+        #   "prev2_extreme" -> option leg: initial SL at the 3rd-last candle
+        #                      extreme, then trail to the 2nd-last candle
+        #                      extreme each bar; a full exit on target.
+        self.target_mode = target_mode
+        self.target_premium_pct = target_premium_pct
+        self.trail_mode = trail_mode
 
         history_len = max(200, sma_period + 5)
         self._candles = deque(maxlen=history_len)
@@ -209,7 +223,10 @@ class SmaCrossOptionStrategy:
             if risk <= 0:
                 risk = entry_price * 0.005  # degenerate fallback, shouldn't normally happen
                 sl = entry_price - risk
-            target = entry_price + self.risk_reward * risk
+            if self.target_mode == "premium_pct":
+                target = entry_price * (1.0 + self.target_premium_pct)
+            else:
+                target = entry_price + self.risk_reward * risk
             signal = Signal.ENTER_LONG_CE
             self.extreme_since_entry = candle.high
         else:
@@ -218,7 +235,10 @@ class SmaCrossOptionStrategy:
             if risk <= 0:
                 risk = entry_price * 0.005
                 sl = entry_price + risk
-            target = entry_price - self.risk_reward * risk
+            if self.target_mode == "premium_pct":
+                target = entry_price * (1.0 - self.target_premium_pct)
+            else:
+                target = entry_price - self.risk_reward * risk
             signal = Signal.ENTER_SHORT_PE
             self.extreme_since_entry = candle.low
 
@@ -234,6 +254,9 @@ class SmaCrossOptionStrategy:
         return StrategyEvent(signal, entry_price, stop_loss=sl, target=target)
 
     def _process_in_position(self, candle, sma):
+        if self.trail_mode == "prev2_extreme":
+            return self._manage_prev2(candle)
+
         long = self.direction == "LONG"
 
         # 1. Stop check against the stop as it stood BEFORE this candle.
@@ -283,6 +306,41 @@ class SmaCrossOptionStrategy:
                 self._currently_touching_sma = False
 
         return StrategyEvent(Signal.NONE, candle.close)
+
+    def _manage_prev2(self, candle):
+        """Option-leg management: initial SL already sits at the 3rd-last
+        candle's extreme; each closed candle trails it to the 2nd-last
+        candle's extreme (never loosening) and a full exit is taken when the
+        premium target (e.g. +100%) is reached."""
+        long = self.direction == "LONG"
+
+        # 1. Stop check against the stop as it stood BEFORE this candle.
+        hit_sl = candle.low <= self.stop_loss if long else candle.high >= self.stop_loss
+        if hit_sl:
+            exit_price = self.stop_loss
+            reason = ExitReason.TRAILING_STOP if self.trailing else ExitReason.STOP_LOSS
+            self._reset()
+            return StrategyEvent(Signal.EXIT, exit_price, reason=reason)
+
+        # 2. Premium target -> book the whole position.
+        hit_target = candle.high >= self.target if long else candle.low <= self.target
+        if hit_target:
+            exit_price = self.target
+            self._reset()
+            return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.TARGET_HIT)
+
+        # 3. Trail the stop to the 2nd-last candle's extreme (the just-closed
+        #    candle is _candles[-1], so the "previous 2nd candle" is [-2]).
+        if len(self._candles) >= 2:
+            trail = self._candles[-2].low if long else self._candles[-2].high
+            if long and trail > self.stop_loss:
+                self.stop_loss = trail
+                self.trailing = True
+            elif (not long) and trail < self.stop_loss:
+                self.stop_loss = trail
+                self.trailing = True
+
+        return StrategyEvent(Signal.NONE, candle.close, stop_loss=self.stop_loss)
 
     def force_exit(self, price: Optional[float], reason: ExitReason = ExitReason.FORCED_EOD) -> StrategyEvent:
         """Call at end-of-day (or on shutdown) to flatten any open position."""
