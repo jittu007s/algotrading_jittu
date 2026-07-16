@@ -29,7 +29,8 @@ from datetime import datetime, time as dtime, timedelta
 import config
 from angel_api import AngelBrokingClient
 from instruments import find_offset_option, load_scrip_master
-from strategy import Candle, ExitReason, Signal, SmaCrossOptionStrategy
+from strategy import (Candle, ExitReason, OptionPremiumStrategy, Signal,
+                      SmaCrossOptionStrategy)
 
 NO_ENTRY_AFTER = dtime(*config.NO_ENTRY_AFTER_HOUR_MINUTE)
 SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
@@ -46,10 +47,19 @@ def fetch_candles(client, exchange, token, from_dt, to_dt):
 
 
 def build_index_strategy():
-    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
+    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD,
+                                  risk_reward=config.RISK_REWARD, signal_only=True)
 
 
 def build_option_leg(target_pct):
+    if getattr(config, "OPTION_LEG_MODE", "premium_ladder") == "premium_ladder":
+        return OptionPremiumStrategy(
+            sma_period=config.SMA_PERIOD, swing_k=config.OPTION_SWING_K,
+            swing_lookback=config.OPTION_SWING_LOOKBACK,
+            fallback_risk_pct=config.OPTION_FALLBACK_RISK_PCT,
+            ladder_start_pct=config.OPTION_LADDER_START_PCT,
+            ladder_step_pct=config.OPTION_LADDER_STEP_PCT,
+            ladder_lock_offset_pct=config.OPTION_LADDER_LOCK_OFFSET_PCT)
     return SmaCrossOptionStrategy(
         sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD, long_only=True,
         target_mode="premium_pct", target_premium_pct=target_pct, trail_mode="prev2_extreme")
@@ -207,9 +217,10 @@ def main():
         print(f"  {day}: {len(trades)} trade(s), premium net {day_pts:+.2f} pts "
               f"({day_pct:+.1f}% on entry), {len(skips)} skipped")
         for t in trades:
+            tgt = "ladder" if t["target"] is None else f"{t['target']:.2f}"
             print(f"      {t['otype']} {t['strike']:.0f} idx@{t['index_time']:%H:%M} "
                   f"buy {t['entry_time']:%H:%M} entry={t['entry']:.2f} sl={t['sl']:.2f} "
-                  f"target={t['target']:.2f} -> exit {t['exit_time']:%H:%M} {t['exit']:.2f} "
+                  f"target={tgt} -> exit {t['exit_time']:%H:%M} {t['exit']:.2f} "
                   f"({t['reason']}) {t['points']:+.2f} ({t['pct']:+.1f}%)")
         for ts, otype, reason in skips:
             print(f"      · skip {ts:%H:%M} {otype}: {reason}")

@@ -89,13 +89,20 @@ class StrategyEvent:
 class SmaCrossOptionStrategy:
     def __init__(self, sma_period: int = 18, risk_reward: float = 3.0,
                  long_only: bool = False, target_mode: str = "rr",
-                 target_premium_pct: float = 1.0, trail_mode: str = "smma"):
+                 target_premium_pct: float = 1.0, trail_mode: str = "smma",
+                 signal_only: bool = False, ladder_start_pct: float = 30.0,
+                 ladder_step_pct: float = 20.0, ladder_lock_offset_pct: float = 20.0):
         self.sma_period = sma_period
         self.risk_reward = risk_reward
         # When True, only cross-UP setups arm (used when the indicator runs
         # on an option's OWN candles: you BUY the option on a cross-up, and
         # never "short" it). A cross-down simply produces no setup.
         self.long_only = long_only
+        # signal_only: fire the ENTER signal on the 2nd consecutive close
+        # across the SMMA (the "arm" condition) and immediately reset to IDLE
+        # WITHOUT taking or managing a position. Used for the INDEX stage of
+        # the two-stage flow, where we only need the direction, not a trade.
+        self.signal_only = signal_only
         # target_mode:
         #   "rr"          -> target = entry +/- risk_reward * risk (index rules)
         #   "premium_pct" -> target = entry * (1 +/- target_premium_pct); used
@@ -106,9 +113,17 @@ class SmaCrossOptionStrategy:
         #   "prev2_extreme" -> option leg: initial SL at the 3rd-last candle
         #                      extreme, then trail to the 2nd-last candle
         #                      extreme each bar; a full exit on target.
+        #   "pct_ladder"    -> option leg: profit-percentage ladder. When the
+        #                      premium's gain reaches ladder_start_pct, lock
+        #                      (start - lock_offset)%; each further step of
+        #                      ladder_step_pct locks another step (e.g. reach
+        #                      30% -> lock 10%, reach 50% -> lock 30%, ...).
         self.target_mode = target_mode
         self.target_premium_pct = target_premium_pct
         self.trail_mode = trail_mode
+        self.ladder_start_pct = ladder_start_pct
+        self.ladder_step_pct = ladder_step_pct
+        self.ladder_lock_offset_pct = ladder_lock_offset_pct
 
         history_len = max(200, sma_period + 5)
         self._candles = deque(maxlen=history_len)
@@ -176,19 +191,30 @@ class SmaCrossOptionStrategy:
         if prev_sma is None:
             return StrategyEvent(Signal.NONE, candle.close)
 
-        if (prev_candle.close > prev_sma and candle.close > sma
-                and self._seen_close_below):
+        long_cross = (prev_candle.close > prev_sma and candle.close > sma
+                      and self._seen_close_below)
+        short_cross = (not self.long_only
+                       and prev_candle.close < prev_sma and candle.close < sma
+                       and self._seen_close_above)
+
+        if long_cross:
+            self._seen_close_below = False    # consume the cross
+            if self.signal_only:
+                # Index stage: emit the direction on the 2nd close above and
+                # stay flat so the next cross can fire again.
+                return StrategyEvent(Signal.ENTER_LONG_CE, candle.close,
+                                     note="index 2-close cross up")
             self.state = "ARMED"
             self.direction = "LONG"
             self.trigger_level = candle.high  # high of the 2nd (latest) candle
-            self._seen_close_below = False    # consume the cross
-        elif (not self.long_only
-                and prev_candle.close < prev_sma and candle.close < sma
-                and self._seen_close_above):
+        elif short_cross:
+            self._seen_close_above = False
+            if self.signal_only:
+                return StrategyEvent(Signal.ENTER_SHORT_PE, candle.close,
+                                     note="index 2-close cross down")
             self.state = "ARMED"
             self.direction = "SHORT"
             self.trigger_level = candle.low   # low of the 2nd (latest) candle
-            self._seen_close_above = False
 
         return StrategyEvent(Signal.NONE, candle.close)
 
@@ -254,6 +280,8 @@ class SmaCrossOptionStrategy:
         return StrategyEvent(signal, entry_price, stop_loss=sl, target=target)
 
     def _process_in_position(self, candle, sma):
+        if self.trail_mode == "pct_ladder":
+            return self._manage_ladder(candle)
         if self.trail_mode == "prev2_extreme":
             return self._manage_prev2(candle)
 
@@ -307,6 +335,35 @@ class SmaCrossOptionStrategy:
 
         return StrategyEvent(Signal.NONE, candle.close)
 
+    def _manage_ladder(self, candle):
+        """Option-leg management via a profit-percentage ladder (long only).
+
+        The initial stop is whatever was set at entry (e.g. the swing low).
+        Once the premium's gain reaches `ladder_start_pct`, the stop locks in
+        (start - lock_offset)%; every further `ladder_step_pct` of gain locks
+        another step. With the defaults 30/20/20 that is: reach 30% -> lock
+        10%, reach 50% -> lock 30%, reach 70% -> lock 50%, and so on. The
+        stop never loosens; the position exits when price trades back to it."""
+        # 1. Stop check against the stop as it stood BEFORE this candle.
+        if candle.low <= self.stop_loss:
+            exit_price = self.stop_loss
+            reason = ExitReason.TRAILING_STOP if self.trailing else ExitReason.STOP_LOSS
+            self._reset()
+            return StrategyEvent(Signal.EXIT, exit_price, reason=reason)
+
+        # 2. Raise the stop up the ladder based on the peak gain this candle.
+        gain_pct = (candle.high - self.entry_price) / self.entry_price * 100.0
+        if gain_pct >= self.ladder_start_pct:
+            steps = int((gain_pct - self.ladder_start_pct) // self.ladder_step_pct)
+            threshold = self.ladder_start_pct + steps * self.ladder_step_pct
+            lock_pct = threshold - self.ladder_lock_offset_pct
+            new_sl = self.entry_price * (1.0 + lock_pct / 100.0)
+            if new_sl > self.stop_loss:
+                self.stop_loss = new_sl
+                self.trailing = True
+
+        return StrategyEvent(Signal.NONE, candle.close, stop_loss=self.stop_loss)
+
     def _manage_prev2(self, candle):
         """Option-leg management: initial SL already sits at the 3rd-last
         candle's extreme; each closed candle trails it to the 2nd-last
@@ -359,6 +416,80 @@ class SmaCrossOptionStrategy:
         self.extreme_since_entry = None
         self.sma_touch_count = 0
         self._currently_touching_sma = False
+
+
+class OptionPremiumStrategy(SmaCrossOptionStrategy):
+    """Option-leg confirmation on the premium chart (the user's rules):
+
+      * BUY when two consecutive candles CLOSE above the SMMA (a cross-up on
+        the option premium), entering at the CLOSE of the 2nd such candle -
+        not on a later break of its high.
+      * Initial stop loss = the previous SWING LOW of the premium.
+      * Percentage-ladder trailing (see _manage_ladder): reach 30% -> lock
+        10%, reach 50% -> lock 30%, reach 70% -> lock 50%, ...
+
+    Always long-only (you buy the option). Direction on the underlying is
+    already decided by the index stage; here we simply confirm and manage.
+    """
+
+    def __init__(self, sma_period: int = 18, swing_k: int = 2,
+                 swing_lookback: int = 10, fallback_risk_pct: float = 20.0,
+                 ladder_start_pct: float = 30.0, ladder_step_pct: float = 20.0,
+                 ladder_lock_offset_pct: float = 20.0):
+        super().__init__(sma_period=sma_period, long_only=True,
+                         trail_mode="pct_ladder", ladder_start_pct=ladder_start_pct,
+                         ladder_step_pct=ladder_step_pct,
+                         ladder_lock_offset_pct=ladder_lock_offset_pct)
+        self.swing_k = swing_k
+        self.swing_lookback = swing_lookback
+        self.fallback_risk_pct = fallback_risk_pct
+
+    def _process_idle(self, candle, sma):
+        if sma is None or len(self._candles) < 2:
+            return StrategyEvent(Signal.NONE, candle.close)
+        prev_candle = self._candles[-2]
+        prev_sma = self._sma_history[-2]
+        if prev_sma is None:
+            return StrategyEvent(Signal.NONE, candle.close)
+
+        # Two consecutive closes above the SMMA (a fresh cross up) -> BUY at
+        # this (2nd) candle's close.
+        if (prev_candle.close > prev_sma and candle.close > sma
+                and self._seen_close_below):
+            self._seen_close_below = False
+            entry = candle.close
+            swing = self._recent_swing_low()
+            if swing is not None and swing < entry:
+                sl = swing
+            else:  # degenerate (no valid swing below entry) -> % fallback stop
+                sl = entry * (1.0 - self.fallback_risk_pct / 100.0)
+            self.state = "IN_POSITION"
+            self.direction = "LONG"
+            self.entry_price = entry
+            self.stop_loss = sl
+            self.target = None
+            self.trailing = False
+            self._risk = entry - sl
+            self.extreme_since_entry = candle.high
+            return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl,
+                                 target=None, note="option 2-close cross up")
+        return StrategyEvent(Signal.NONE, candle.close)
+
+    def _recent_swing_low(self):
+        """Most recent pivot low (a low with `swing_k` higher lows on each
+        side) among the candles seen so far; falls back to the lowest low of
+        the last `swing_lookback` candles when no pivot has formed yet."""
+        lows = [c.low for c in self._candles]
+        n = len(lows)
+        k = self.swing_k
+        # skip the just-closed entry candle ([-1]); scan backwards for a pivot
+        for i in range(n - 1 - k, k - 1, -1):
+            left = lows[i - k:i]
+            right = lows[i + 1:i + 1 + k]
+            if left and right and lows[i] < min(left) and lows[i] <= min(right):
+                return lows[i]
+        window = lows[-self.swing_lookback:]
+        return min(window) if window else None
 
 
 class OpeningRangeBreakout:

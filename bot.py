@@ -19,7 +19,8 @@ from angel_api import AngelBrokingClient
 from instruments import find_atm_option, find_offset_option, load_scrip_master
 from quant_strategy import RegimeAdaptiveStrategy
 from strategy import (Candle, FVGRetestStrategy, OpeningRangeBreakout,
-                      PullbackConfirmStrategy, Signal, SmaCrossOptionStrategy)
+                      OptionPremiumStrategy, PullbackConfirmStrategy, Signal,
+                      SmaCrossOptionStrategy)
 
 
 def build_strategy():
@@ -342,10 +343,21 @@ def run_option_chart_loop(client, scrip_master):
 # ---------------------------------------------------------------------------
 
 def build_index_strategy():
-    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD)
+    # Index stage: fire the direction on the 2nd consecutive close across the
+    # SMMA (signal only - never holds an index position).
+    return SmaCrossOptionStrategy(sma_period=config.SMA_PERIOD,
+                                  risk_reward=config.RISK_REWARD, signal_only=True)
 
 
 def build_option_leg_strategy():
+    if getattr(config, "OPTION_LEG_MODE", "premium_ladder") == "premium_ladder":
+        return OptionPremiumStrategy(
+            sma_period=config.SMA_PERIOD, swing_k=config.OPTION_SWING_K,
+            swing_lookback=config.OPTION_SWING_LOOKBACK,
+            fallback_risk_pct=config.OPTION_FALLBACK_RISK_PCT,
+            ladder_start_pct=config.OPTION_LADDER_START_PCT,
+            ladder_step_pct=config.OPTION_LADDER_STEP_PCT,
+            ladder_lock_offset_pct=config.OPTION_LADDER_LOCK_OFFSET_PCT)
     return SmaCrossOptionStrategy(
         sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD, long_only=True,
         target_mode="premium_pct", target_premium_pct=config.OPTION_TARGET_PREMIUM_PCT,
@@ -471,9 +483,9 @@ def warm_from_history(client, strat, token, exchange, interval):
 def buy_leg(client, pending, event):
     option = pending["option"]
     qty = option["lotsize"] or config.LOT_SIZE
-    logger.info("[STAGE2] CONFIRM %s option_price=%.2f qty=%s | SL=%.2f target=%.2f (+%.0f%%)",
-                option["symbol"], event.price, qty, event.stop_loss, event.target,
-                config.OPTION_TARGET_PREMIUM_PCT * 100)
+    target_txt = "ladder" if event.target is None else f"{event.target:.2f}"
+    logger.info("[STAGE2] CONFIRM %s option_price=%.2f qty=%s | SL=%.2f target=%s",
+                option["symbol"], event.price, qty, event.stop_loss, target_txt)
     if not config.DRY_RUN:
         client.place_market_order(
             exchange=config.index_config()["option_exchange"], tradingsymbol=option["symbol"],

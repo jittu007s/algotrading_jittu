@@ -53,8 +53,31 @@ STRIKE_OFFSET = 2
 # Candles to wait for the option-chart crossover to confirm after the index
 # signal; if it does not confirm within this many candles the setup is dropped.
 OPTION_CONFIRM_VALIDITY = 10
+# How the option leg (stage 2) enters and manages the trade:
+#   "premium_ladder" - the user's premium-chart rules: enter at the CLOSE of
+#            the 2nd consecutive candle that closes ABOVE the SMMA, initial
+#            stop = previous swing low, then a profit-% ladder trailing stop
+#            (reach 30% -> lock 10%, reach 50% -> lock 30%, ...). No fixed
+#            take-profit; the trade rides until the laddered stop is hit.
+#   "premium_pct" - simpler: enter on a cross-up break, initial stop at the
+#            3rd-last candle low trailed to the 2nd-last, exit at +100%.
+OPTION_LEG_MODE = "premium_ladder"
+
+# Percentage ladder (used by "premium_ladder"). Defaults encode the spec:
+#   at +LADDER_START% lock (START-LOCK_OFFSET)%, every +LADDER_STEP% locks
+#   another step. 30 / 20 / 20 -> 30%->10%, 50%->30%, 70%->50%, ...
+OPTION_LADDER_START_PCT = 30.0
+OPTION_LADDER_STEP_PCT = 20.0
+OPTION_LADDER_LOCK_OFFSET_PCT = 20.0
+# Swing-low stop settings (premium_ladder). SWING_K = pivot strength (bars on
+# each side); SWING_LOOKBACK = fallback lowest-low window when no pivot yet.
+OPTION_SWING_K = 2
+OPTION_SWING_LOOKBACK = 10
+# Fallback stop distance (% below entry) if no swing low sits below entry.
+OPTION_FALLBACK_RISK_PCT = 20.0
+
 # Book the whole option position when the premium gains this fraction
-# (1.0 = +100%, i.e. the premium doubles).
+# (1.0 = +100%). Only used by the "premium_pct" option-leg mode.
 OPTION_TARGET_PREMIUM_PCT = 1.0
 
 # Per-index instrument map. VERIFY tokens / strike steps / exchanges against
