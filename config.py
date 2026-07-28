@@ -26,7 +26,7 @@ LOT_SIZE = 65
 # --- Strategy parameters -----------------------------------------------
 # Angel One candle interval enum: ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE,
 # TEN_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ONE_HOUR, ONE_DAY
-CANDLE_INTERVAL = "THREE_MINUTE"
+CANDLE_INTERVAL = "FIFTEEN_MINUTE"
 SMA_PERIOD = 18   # period of the SMMA (smoothed MA, TradingView "SMMA 20 close")
 RISK_REWARD = 2.5
 
@@ -196,7 +196,7 @@ KRONOS_DEVICE = None          # None -> auto (cuda if available, else cpu)
 KRONOS_MAX_CONTEXT = 512      # model context limit
 KRONOS_LOOKBACK = 256         # candles of history fed to the model per forecast
 KRONOS_HORIZON = 10           # candles ahead to predict (10 x 3min = 30 min)
-KRONOS_THRESHOLD_PCT = 0.15   # min predicted index move (%) to take a side
+KRONOS_THRESHOLD_PCT = 0.30   # min predicted index move (%) to take a side
 KRONOS_DECISION_EVERY = 5     # forecast every N candles while flat (throttle compute)
 KRONOS_T = 1.0                # sampling temperature
 KRONOS_TOP_P = 0.9            # nucleus sampling
