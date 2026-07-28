@@ -99,21 +99,55 @@ class Forecast:
         return (self.cur_close - min(self.low)) / self.cur_close * 100.0
 
 
+def _kronos_root_candidates():
+    """Directories that might BE the Kronos repo root (i.e. contain `model/`).
+
+    Checked in priority order. Auto-discovery matters because Kronos's `model`
+    package uses absolute imports (`from model.x import ...`), which only
+    resolve when the repo ROOT is on sys.path - and because a tracked
+    config.py can be overwritten by a git pull, so we must not depend on it.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for src in (getattr(config, "KRONOS_REPO_PATH", None), os.getenv("KRONOS_REPO_PATH")):
+        if src:
+            out += [src, os.path.join(src, "Kronos")]
+    # common spots: beside this file, in the cwd, one level up, or in $HOME
+    for base in (here, os.getcwd(), os.path.dirname(here), os.path.expanduser("~")):
+        out += [os.path.join(base, "Kronos"), os.path.join(base, "kronos"), base]
+    return out
+
+
+def _find_kronos_root():
+    """First candidate directory that actually contains a `model` package."""
+    seen = set()
+    for d in _kronos_root_candidates():
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        try:
+            if os.path.isdir(os.path.join(d, "model")):
+                return d
+        except OSError:
+            continue
+    return None
+
+
 def _load_kronos():
-    """Import Kronos, honouring config.KRONOS_REPO_PATH (a clone of
-    github.com/shiyu-coder/Kronos) so you need not set PYTHONPATH.
+    """Import Kronos, auto-discovering a clone of github.com/shiyu-coder/Kronos.
+
+    Looks for the repo ROOT (the folder containing the `model` package) via
+    config.KRONOS_REPO_PATH, the KRONOS_REPO_PATH env var, then beside this
+    file / the cwd / $HOME, and puts it on sys.path so Kronos's absolute
+    imports resolve.
 
     Returns (Kronos, KronosTokenizer, KronosPredictor). Only a module that
     actually exposes all three classes is accepted - so a bare `Kronos`
     namespace folder is never returned by mistake - and if nothing works the
     real underlying import errors (e.g. a missing torch/einops) are surfaced."""
-    repo = getattr(config, "KRONOS_REPO_PATH", None)
-    if repo:
-        # accept either the repo root (contains the `model/` package) or its
-        # parent, so a Windows path like C:\...\Kronos just works.
-        for cand in (repo, os.path.join(repo, "Kronos")):
-            if os.path.isdir(cand) and cand not in sys.path:
-                sys.path.insert(0, cand)
+    root = _find_kronos_root()
+    if root and root not in sys.path:
+        sys.path.insert(0, root)
 
     # Import torch FIRST. On Windows, loading pandas/numpy/SmartApi (which pull
     # their own MKL/OpenMP DLLs) before torch can break torch's native init
@@ -155,16 +189,22 @@ def _load_kronos():
         errors.append(f"{modname}: imported but missing {names}")
 
     tried = "\n  ".join(errors)
+    found = f"auto-detected Kronos root: {root}" if root else (
+        "NO Kronos repo root found (no directory containing a `model` package "
+        "in config.KRONOS_REPO_PATH, $KRONOS_REPO_PATH, beside kronos_strategy.py, "
+        "the cwd, or $HOME)")
     raise ImportError(
-        "Kronos could not be loaded. Checklist:\n"
-        "  1) git clone https://github.com/shiyu-coder/Kronos\n"
-        "  2) pip install -r requirements-kronos.txt   (torch, einops, "
-        "huggingface_hub, safetensors, ...)\n"
-        "  3) config.py:  KRONOS_REPO_PATH = r\"C:\\\\path\\\\to\\\\Kronos\"  "
-        "(the folder containing the `model` package)\n"
-        "The `model` package must expose Kronos, KronosTokenizer, KronosPredictor.\n"
-        "Tip: the errors below usually name a MISSING DEPENDENCY (e.g. torch) - "
-        "install it and retry.\n"
+        "Kronos could not be loaded.\n"
+        f"{found}\n"
+        "Fix by EITHER cloning next to this script:\n"
+        "    git clone https://github.com/shiyu-coder/Kronos\n"
+        "  (a `Kronos/model/` folder beside kronos_strategy.py is picked up "
+        "automatically)\n"
+        "OR pointing at an existing clone WITHOUT editing tracked files:\n"
+        "    set KRONOS_REPO_PATH=C:\\path\\to\\Kronos          (Windows cmd)\n"
+        "    export KRONOS_REPO_PATH=/path/to/Kronos           (bash/git-bash)\n"
+        "That path must be the folder CONTAINING the `model` package.\n"
+        "Also ensure deps are installed: pip install -r requirements-kronos.txt\n"
         f"Import attempts:\n  {tried}")
 
 
