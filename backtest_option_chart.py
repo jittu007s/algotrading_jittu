@@ -82,7 +82,8 @@ def build_option_leg(target_pct):
         target_mode="premium_pct", target_premium_pct=target_pct, trail_mode="prev2_extreme")
 
 
-def simulate_option_leg(ocandles, signal_time, validity, target_pct):
+def simulate_option_leg(ocandles, signal_time, validity, target_pct,
+                        carry_forward=False):
     """Warm the option-leg SMMA on candles up to the index-signal time, then
     look for the option-chart confirmation within `validity` candles and,
     if it confirms, manage the trade to exit. Returns a result dict."""
@@ -100,7 +101,8 @@ def simulate_option_leg(ocandles, signal_time, validity, target_pct):
     entry_time = sl = target = None
     age = 0
     for c in post:
-        if c.timestamp.time() >= SQUARE_OFF:
+        # a carried (next-expiry) position is never squared off
+        if not carry_forward and c.timestamp.time() >= SQUARE_OFF:
             if entry is not None:
                 strat.force_exit(price=None)
                 return dict(confirmed=True, entry=entry, entry_time=entry_time,
@@ -115,7 +117,8 @@ def simulate_option_leg(ocandles, signal_time, validity, target_pct):
                 # The live bot refuses a NEW position at/after the cutoff, so
                 # the backtest must too - otherwise it books trades that could
                 # never have been taken (and that get squared off minutes later).
-                if c.timestamp.time() >= NO_ENTRY_AFTER:
+                # Carried positions are exempt (they are never squared off).
+                if not carry_forward and c.timestamp.time() >= NO_ENTRY_AFTER:
                     strat.force_exit(price=None)
                     return dict(confirmed=False, reason="confirm_past_entry_cutoff")
                 entry, entry_time, sl, target = ev.price, c.timestamp, ev.stop_loss, ev.target

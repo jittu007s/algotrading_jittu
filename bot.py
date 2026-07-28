@@ -16,7 +16,8 @@ from datetime import datetime, timedelta
 
 import config
 from angel_api import AngelBrokingClient
-from instruments import find_atm_option, find_offset_option, load_scrip_master
+from instruments import (find_atm_option, find_offset_option, is_expiry_day,
+                         load_scrip_master)
 from sizing import compute_size
 from quant_strategy import RegimeAdaptiveStrategy
 from strategy import (Candle, FVGRetestStrategy, OpeningRangeBreakout,
@@ -405,11 +406,32 @@ def build_option_leg_strategy():
         trail_mode="prev2_extreme")
 
 
-def resolve_leg_option(scrip_master, spot, option_type, ic):
+def is_past_expiry_switch(now):
+    h, m = getattr(config, "EXPIRY_SWITCH_HOUR_MINUTE", (14, 45))
+    return (now.hour, now.minute) >= (h, m)
+
+
+def use_next_expiry(scrip_master, ic, now=None):
+    """True when we must avoid the same-day-expiry contract: it is an expiry
+    day AND we are past the switch time. Such a trade goes on the NEXT expiry
+    and is carried forward instead of being squared off."""
+    now = now or datetime.now()
+    if not is_past_expiry_switch(now):
+        return False
+    try:
+        return is_expiry_day(scrip_master, underlying=ic["name"],
+                             option_exchange=ic["option_exchange"],
+                             as_of=now.date())
+    except Exception:
+        logger.warning("Could not determine expiry day; assuming not", exc_info=True)
+        return False
+
+
+def resolve_leg_option(scrip_master, spot, option_type, ic, skip_same_day=False):
     return find_offset_option(
         scrip_master, spot, option_type=option_type, offset=config.STRIKE_OFFSET,
         underlying=ic["name"], strike_step=ic["strike_step"],
-        option_exchange=ic["option_exchange"])
+        option_exchange=ic["option_exchange"], skip_same_day=skip_same_day)
 
 
 def run_index_option_confirm_loop(client, scrip_master):
@@ -437,9 +459,15 @@ def run_index_option_confirm_loop(client, scrip_master):
 
             # -- square-off any open option position --------------------------
             if held and is_past_square_off(now):
-                event = held["strat"].force_exit(price=None)
-                sell_held(client, held, event)
-                held = None
+                if held.get("carry_forward"):
+                    # next-expiry position taken late on an expiry day: hold it
+                    # overnight instead of squaring off.
+                    logger.info("[CARRY] holding %s (expiry %s) overnight - no square-off",
+                                held["symbol"], held.get("expiry"))
+                else:
+                    event = held["strat"].force_exit(price=None)
+                    sell_held(client, held, event)
+                    held = None
 
             # -- STAGE 2a: manage an open option position ---------------------
             if held:
@@ -486,19 +514,27 @@ def run_index_option_confirm_loop(client, scrip_master):
                     continue
                 if event.signal in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE) \
                         and held is None:
-                    if is_past_entry_cutoff(datetime.now()):
+                    carry = use_next_expiry(scrip_master, ic)
+                    cutoff_applies = not (carry and getattr(
+                        config, "CARRY_FORWARD_IGNORES_ENTRY_CUTOFF", True))
+                    if cutoff_applies and is_past_entry_cutoff(datetime.now()):
                         index_strategy.force_exit(price=None)
                         continue
                     otype = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
                     try:
-                        option = resolve_leg_option(scrip_master, candle.close, otype, ic)
+                        option = resolve_leg_option(scrip_master, candle.close, otype, ic,
+                                                    skip_same_day=carry)
                     except LookupError as exc:
                         logger.warning("Could not resolve %s option: %s", otype, exc)
                         continue
+                    if carry:
+                        logger.info("[EXPIRY] past %02d:%02d on expiry day -> using next "
+                                    "expiry %s and carrying forward",
+                                    *config.EXPIRY_SWITCH_HOUR_MINUTE, option.get("expiry"))
                     strat = build_option_leg_strategy()
                     warm_from_history(client, strat, option["token"], ic["option_exchange"], interval)
                     pending = {"option": option, "otype": otype, "strat": strat,
-                               "last_ts": None, "age": 0}
+                               "carry_forward": carry, "last_ts": None, "age": 0}
                     logger.info("[STAGE1] index %s @%.2f -> watch %s (strike %s) for confirm",
                                 otype, candle.close, option["symbol"], option["strike"])
 
@@ -530,30 +566,39 @@ def buy_leg(client, pending, event):
         logger.warning("[STAGE2] BUY skipped (%s) - %s", option["symbol"], s.reason)
         return None
     qty = s.quantity
+    carry = bool(pending.get("carry_forward"))
+    # An INTRADAY position is auto-squared by the broker at the close, so a
+    # carried position MUST use the overnight (CARRYFORWARD/NRML) product.
+    product = (config.CARRY_FORWARD_PRODUCT_TYPE if carry else config.PRODUCT_TYPE)
     target_txt = "ladder" if event.target is None else f"{event.target:.2f}"
-    logger.info("[STAGE2] CONFIRM %s option_price=%.2f qty=%s (%d lots, cost~%.0f: %s) "
-                "| SL=%.2f target=%s",
-                option["symbol"], event.price, qty, s.lots, s.cost, s.reason,
-                event.stop_loss, target_txt)
+    logger.info("[STAGE2] CONFIRM %s (expiry %s%s) option_price=%.2f qty=%s "
+                "(%d lots, cost~%.0f: %s) product=%s | SL=%.2f target=%s",
+                option["symbol"], option.get("expiry"),
+                ", CARRY FORWARD" if carry else "", event.price, qty,
+                s.lots, s.cost, s.reason, product, event.stop_loss, target_txt)
     if not config.DRY_RUN:
         client.place_market_order(
             exchange=config.index_config()["option_exchange"], tradingsymbol=option["symbol"],
             symboltoken=option["token"], transaction_type="BUY", quantity=qty,
-            producttype=config.PRODUCT_TYPE)
+            producttype=product)
     return {"symbol": option["symbol"], "token": option["token"], "quantity": qty,
-            "strat": pending["strat"], "last_ts": pending["last_ts"], "otype": pending["otype"]}
+            "strat": pending["strat"], "last_ts": pending["last_ts"],
+            "otype": pending["otype"], "carry_forward": carry, "product": product,
+            "expiry": option.get("expiry")}
 
 
 def sell_held(client, held, event):
     reason = event.reason.value if event.reason else "unknown"
     price = "n/a" if event.price is None else f"{event.price:.2f}"
-    logger.info("[EXIT] (%s) %s option_price=%s qty=%s",
-                reason, held["symbol"], price, held["quantity"])
+    # exit with the SAME product the position was opened under
+    product = held.get("product") or config.PRODUCT_TYPE
+    logger.info("[EXIT] (%s) %s option_price=%s qty=%s product=%s",
+                reason, held["symbol"], price, held["quantity"], product)
     if not config.DRY_RUN:
         client.place_market_order(
             exchange=config.index_config()["option_exchange"], tradingsymbol=held["symbol"],
             symboltoken=held["token"], transaction_type="SELL", quantity=held["quantity"],
-            producttype=config.PRODUCT_TYPE)
+            producttype=product)
 
 
 # ---------------------------------------------------------------------------
@@ -597,9 +642,15 @@ def run_kronos_option_loop(client, scrip_master, forecaster):
             now = datetime.now()
 
             if held and is_past_square_off(now):
-                event = held["strat"].force_exit(price=None)
-                sell_held(client, held, event)
-                held = None
+                if held.get("carry_forward"):
+                    # next-expiry position taken late on an expiry day: hold it
+                    # overnight instead of squaring off.
+                    logger.info("[CARRY] holding %s (expiry %s) overnight - no square-off",
+                                held["symbol"], held.get("expiry"))
+                else:
+                    event = held["strat"].force_exit(price=None)
+                    sell_held(client, held, event)
+                    held = None
 
             # -- manage an open option position ------------------------------
             if held:
@@ -661,7 +712,13 @@ def run_kronos_option_loop(client, scrip_master, forecaster):
                 if since_decision < decision_every:
                     continue
                 since_decision = 0
-                if is_past_entry_cutoff(datetime.now()):
+                # Past the expiry-day switch we move to the NEXT expiry and
+                # carry it forward; such a trade is exempt from the intraday
+                # no-entry cutoff because it is never squared off.
+                carry = use_next_expiry(scrip_master, ic)
+                cutoff_applies = not (carry and getattr(
+                    config, "CARRY_FORWARD_IGNORES_ENTRY_CUTOFF", True))
+                if cutoff_applies and is_past_entry_cutoff(datetime.now()):
                     continue
 
                 signal, fc = signal_strategy.decide(index_hist)
@@ -669,13 +726,19 @@ def run_kronos_option_loop(client, scrip_master, forecaster):
                     continue
                 otype = "CE" if signal == Signal.ENTER_LONG_CE else "PE"
                 try:
-                    option = resolve_leg_option(scrip_master, candle.close, otype, ic)
+                    option = resolve_leg_option(scrip_master, candle.close, otype, ic,
+                                                skip_same_day=carry)
                 except LookupError as exc:
                     logger.warning("Could not resolve %s option: %s", otype, exc)
                     continue
+                if carry:
+                    logger.info("[EXPIRY] past %02d:%02d on expiry day -> using next "
+                                "expiry %s and carrying forward",
+                                *config.EXPIRY_SWITCH_HOUR_MINUTE, option.get("expiry"))
                 strat = build_option_leg_strategy()
                 warm_from_history(client, strat, option["token"], ic["option_exchange"], interval)
                 pending = {"option": option, "otype": otype, "strat": strat,
+                           "carry_forward": carry,
                            "last_ts": None, "age": 0, "direct": not require_confirm}
                 logger.info("[KRONOS] predict %+.2f%% -> %s %s (strike %s); %s",
                             fc.move_pct if fc else 0.0, otype, option["symbol"],

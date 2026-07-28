@@ -48,7 +48,7 @@ except Exception:
     _torch = None
 
 import config
-from instruments import find_offset_option
+from instruments import find_offset_option, is_expiry_day
 from sizing import compute_size
 from strategy import Candle, ExitReason, OptionPremiumStrategy, Signal
 # Reuse the tested option-leg simulation, throttled fetch and builders.
@@ -58,6 +58,7 @@ from backtest_option_chart import (build_option_leg, fetch_candles,
 INTERVAL = config.CANDLE_INTERVAL
 NO_ENTRY_AFTER = dtime(*config.NO_ENTRY_AFTER_HOUR_MINUTE)
 SQUARE_OFF = dtime(*config.SQUARE_OFF_HOUR_MINUTE)
+EXPIRY_SWITCH = dtime(*getattr(config, "EXPIRY_SWITCH_HOUR_MINUTE", (14, 45)))
 
 _INTERVAL_SECONDS = {
     "ONE_MINUTE": 60, "THREE_MINUTE": 180, "FIVE_MINUTE": 300, "TEN_MINUTE": 600,
@@ -303,7 +304,7 @@ class KronosSignalStrategy:
         return Signal.NONE, fc
 
 
-def simulate_option_direct(ocandles, signal_time, build_leg):
+def simulate_option_direct(ocandles, signal_time, build_leg, carry_forward=False):
     """Enter the option directly at the first candle after `signal_time` (no
     2-close confirmation) and manage it with the option leg's ladder. Requires
     an OptionPremiumStrategy (it uses force_enter_long / swing-low stop)."""
@@ -322,16 +323,19 @@ def simulate_option_direct(ocandles, signal_time, build_leg):
         return dict(confirmed=False, reason="no_candles_after_signal")
 
     first = post[0]
-    if first.timestamp.time() >= SQUARE_OFF:
-        return dict(confirmed=False, reason="eod_before_entry")
-    # match the live bot: no NEW position at/after the no-entry cutoff
-    if first.timestamp.time() >= NO_ENTRY_AFTER:
-        return dict(confirmed=False, reason="entry_past_cutoff")
+    # A carried (next-expiry) position is never squared off, so the intraday
+    # square-off / no-entry gates do not apply to it.
+    if not carry_forward:
+        if first.timestamp.time() >= SQUARE_OFF:
+            return dict(confirmed=False, reason="eod_before_entry")
+        # match the live bot: no NEW position at/after the no-entry cutoff
+        if first.timestamp.time() >= NO_ENTRY_AFTER:
+            return dict(confirmed=False, reason="entry_past_cutoff")
     ev = strat.force_enter_long(first)
     entry, sl, entry_time = ev.price, ev.stop_loss, first.timestamp
 
     for c in post[1:]:
-        if c.timestamp.time() >= SQUARE_OFF:
+        if not carry_forward and c.timestamp.time() >= SQUARE_OFF:
             strat.force_exit(price=None)
             return dict(confirmed=True, entry=entry, entry_time=entry_time, exit=c.open,
                         exit_time=c.timestamp, reason=ExitReason.FORCED_EOD.value, sl=sl, target=None)
@@ -364,12 +368,15 @@ class KronosOptionBacktest:
         self.max_losses_per_day = getattr(config, "KRONOS_MAX_LOSSES_PER_DAY", 0)
 
     # -- option data (throttled fetch + retry, no poisoning) --------------
-    def _option_candles(self, client, token, day, cache, skips, when, otype):
-        key = (token, day)
+    def _option_candles(self, client, token, day, cache, skips, when, otype,
+                        span_days=0):
+        """Option candles for `day`; `span_days` extends the window forward so
+        a carried-forward position can be tracked into later sessions."""
+        key = (token, day, span_days)
         if key in cache:
             return cache[key]
         frm = datetime.combine(day, dtime(9, 0))
-        to = datetime.combine(day, dtime(15, 35))
+        to = datetime.combine(day + timedelta(days=span_days), dtime(15, 35))
         cooldown = getattr(config, "RATE_LIMIT_COOLDOWN_SECONDS", 30)
         last_exc = None
         for attempt in range(3):
@@ -399,7 +406,16 @@ class KronosOptionBacktest:
                 continue
             if i % self.decision_every != 0:
                 continue
-            if c.timestamp.time() >= NO_ENTRY_AFTER:
+            # Expiry-day rule: past the switch time, don't touch the contract
+            # expiring today - use the next expiry and carry it forward. Such a
+            # trade is exempt from the intraday cutoff (it is never squared off).
+            carry = (c.timestamp.time() >= EXPIRY_SWITCH
+                     and is_expiry_day(scrip, underlying=self.ic["name"],
+                                       option_exchange=self.ic["option_exchange"],
+                                       as_of=day))
+            cutoff_applies = not (carry and getattr(
+                config, "CARRY_FORWARD_IGNORES_ENTRY_CUTOFF", True))
+            if cutoff_applies and c.timestamp.time() >= NO_ENTRY_AFTER:
                 continue
 
             signal, fc = self.strategy.decide(history)
@@ -410,13 +426,16 @@ class KronosOptionBacktest:
                 option = find_offset_option(
                     scrip, c.close, option_type=otype, offset=self.offset,
                     underlying=self.ic["name"], strike_step=self.ic["strike_step"],
-                    option_exchange=self.ic["option_exchange"], as_of=day)
+                    option_exchange=self.ic["option_exchange"], as_of=day,
+                    skip_same_day=carry)
             except LookupError as exc:
                 skips.append((c.timestamp, otype, str(exc)))
                 continue
 
+            # a carried position lives past today, so pull later sessions too
+            span = getattr(config, "CARRY_FORWARD_TRACK_DAYS", 5) if carry else 0
             ocandles = self._option_candles(client, option["token"], day, cache,
-                                            skips, c.timestamp, otype)
+                                            skips, c.timestamp, otype, span_days=span)
             if ocandles is None:
                 continue
             if not ocandles:
@@ -424,10 +443,12 @@ class KronosOptionBacktest:
                 continue
 
             if self.require_confirm:
-                res = simulate_option_leg(ocandles, c.timestamp, self.validity, self.target_pct)
+                res = simulate_option_leg(ocandles, c.timestamp, self.validity,
+                                          self.target_pct, carry_forward=carry)
             else:
                 res = simulate_option_direct(ocandles, c.timestamp,
-                                             lambda: build_option_leg(self.target_pct))
+                                             lambda: build_option_leg(self.target_pct),
+                                             carry_forward=carry)
             if res.get("confirmed"):
                 move = res["exit"] - res["entry"]
                 # size the trade the same way the live bot would
@@ -439,7 +460,8 @@ class KronosOptionBacktest:
                            index_time=c.timestamp, points=move, pct=move / res["entry"] * 100.0,
                            pred_move=(fc.move_pct if fc else 0.0),
                            lots=sz.lots, qty=sz.quantity, cost=sz.cost,
-                           rupees=move * sz.quantity if sz.ok else 0.0, sized_ok=sz.ok)
+                           rupees=move * sz.quantity if sz.ok else 0.0, sized_ok=sz.ok,
+                           carry=carry, expiry=option.get("expiry"))
                 trades.append(res)
                 busy_until = res["exit_time"]
                 if move < 0:
@@ -572,7 +594,8 @@ def run_backtest(client, forecaster: KronosForecaster, index_name: str,
                   f"idx@{t['index_time']:%H:%M} buy {t['entry_time']:%H:%M} "
                   f"entry={t['entry']:.2f} sl={t['sl']:.2f} -> exit {t['exit_time']:%H:%M} "
                   f"{t['exit']:.2f} ({t['reason']}) {t['points']:+.2f} ({t['pct']:+.1f}%) "
-                  f"x{t.get('qty', 0)} ({t.get('lots', 0)} lots) = {t.get('rupees', 0.0):+,.0f}")
+                  f"x{t.get('qty', 0)} ({t.get('lots', 0)} lots) = {t.get('rupees', 0.0):+,.0f}"
+                  + (f"  [CARRY -> expiry {t.get('expiry')}]" if t.get("carry") else ""))
         for ts, otype, reason in skips:
             print(f"      · skip {ts:%H:%M} {otype}: {reason}")
 

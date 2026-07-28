@@ -153,6 +153,24 @@ FVG_CANDLE_INTERVAL = "THREE_MINUTE"
 PRODUCT_TYPE = "INTRADAY"
 ORDER_VARIETY = "NORMAL"
 
+# --- Expiry-day handling ---------------------------------------------------
+# On an expiry day, a same-day-expiry option bought late in the session is
+# almost pure time decay and dies at the close. After this time (IST) the bot
+# stops trading the expiring contract and uses the NEXT expiry instead, and
+# that position is CARRIED FORWARD (not squared off at SQUARE_OFF_HOUR_MINUTE).
+EXPIRY_SWITCH_HOUR_MINUTE = (14, 45)
+# Carried positions must NOT use an intraday product - the broker auto-squares
+# INTRADAY at the close. Angel One's overnight F&O product is CARRYFORWARD
+# (NRML). Buying options overnight needs only the premium, no extra margin.
+CARRY_FORWARD_PRODUCT_TYPE = "CARRYFORWARD"
+# Carry-forward entries are exempt from NO_ENTRY_AFTER_HOUR_MINUTE, because
+# that cutoff exists to avoid opening a trade minutes before square-off - and
+# a carried position is never squared off. Set False to apply the cutoff too.
+CARRY_FORWARD_IGNORES_ENTRY_CUTOFF = True
+# Backtest only: calendar days of option candles to pull after the entry day so
+# a carried position can be followed until its stop/ladder actually fires.
+CARRY_FORWARD_TRACK_DAYS = 5
+
 # When true (default), signals are logged but no real orders are sent.
 # Flip to false only after you've validated behaviour end-to-end.
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"

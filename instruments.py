@@ -38,10 +38,38 @@ def _parse_expiry(raw: str) -> date:
     return datetime.strptime(raw, "%d%b%Y").date()
 
 
+def upcoming_expiries(scrip_master, underlying: str = "NIFTY",
+                      option_exchange: str = None, as_of: date = None) -> list:
+    """Sorted list of expiry dates on/after `as_of` for this underlying."""
+    floor_date = as_of or date.today()
+    out = set()
+    for item in scrip_master:
+        if item.get("instrumenttype") != "OPTIDX" or item.get("name") != underlying:
+            continue
+        if option_exchange and item.get("exch_seg") != option_exchange:
+            continue
+        try:
+            exp = _parse_expiry(item["expiry"])
+        except (KeyError, ValueError):
+            continue
+        if exp >= floor_date:
+            out.add(exp)
+    return sorted(out)
+
+
+def is_expiry_day(scrip_master, underlying: str = "NIFTY",
+                  option_exchange: str = None, as_of: date = None) -> bool:
+    """True when `as_of` (default today) is itself an expiry date - i.e. the
+    nearest contract expires today, so its options die at the close."""
+    day = as_of or date.today()
+    exps = upcoming_expiries(scrip_master, underlying, option_exchange, day)
+    return bool(exps) and exps[0] == day
+
+
 def find_offset_option(scrip_master, spot_price: float, option_type: str = "CE",
                        offset: int = 0, underlying: str = "NIFTY",
                        strike_step: int = 50, option_exchange: str = None,
-                       as_of: date = None) -> dict:
+                       as_of: date = None, skip_same_day: bool = False) -> dict:
     """Return {symbol, token, expiry, strike, lotsize} for the option `offset`
     strikes away from ATM, of the nearest expiry on/after `as_of`.
 
@@ -82,7 +110,12 @@ def find_offset_option(scrip_master, spot_price: float, option_type: str = "CE",
             strike = float(item["strike"]) / 100  # Angel One stores strike * 100
         except (KeyError, ValueError):
             continue
-        if expiry < floor_date or strike != target_strike:
+        # skip_same_day: on an expiry day, ignore the contract expiring TODAY
+        # and take the next one (so a late setup is not bought into a few
+        # hours of terminal time decay).
+        if expiry < floor_date or (skip_same_day and expiry == floor_date):
+            continue
+        if strike != target_strike:
             continue
         candidates.append((expiry, item, strike))
 
