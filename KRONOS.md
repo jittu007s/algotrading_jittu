@@ -14,11 +14,15 @@ open-source foundation model for financial candlesticks — to forecast the
    (bullish), `<= -threshold` → **PE** (bearish), otherwise no trade.
 3. **Option leg.** The weekly option `STRIKE_OFFSET` strikes OTM/ITM is resolved
    with `find_offset_option` (per-index exchange/strike-step from
-   `config.INDEXES`). Execution reuses the tested option leg:
-   - `KRONOS_REQUIRE_OPTION_CONFIRM = True` → wait for the option premium's own
-     2-close cross-up, then the percentage-ladder exit (30%→lock 10%, 50%→30% …).
-   - `False` → enter directly at the first candle after the signal, same ladder
-     exit, swing-low initial stop.
+   `config.INDEXES`). **The Kronos direction is the only entry gate** — the
+   option is bought at the first candle after the signal
+   (`KRONOS_REQUIRE_OPTION_CONFIRM = False`, the default). The initial stop is
+   the premium's swing low and the percentage ladder manages the exit
+   (30%→lock 10%, 50%→lock 30%, …).
+
+   Setting `KRONOS_REQUIRE_OPTION_CONFIRM = True` re-enables the old second
+   gate (the option premium's own 2-close SMMA cross-up). It is off by default
+   because it rejected ~93% of Kronos signals in testing.
 
 ## Install (heavy; GPU recommended)
 

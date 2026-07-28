@@ -182,7 +182,10 @@ KRONOS_DECISION_EVERY = 5     # forecast every N candles while flat (throttle co
 KRONOS_T = 1.0                # sampling temperature
 KRONOS_TOP_P = 0.9            # nucleus sampling
 KRONOS_SAMPLE_COUNT = 1       # prediction paths to average
-# True  -> after the Kronos direction, still require the option premium's own
-#          2-close cross-up confirmation (reuses the option leg's entry).
-# False -> enter the option directly at the first candle after the signal.
-KRONOS_REQUIRE_OPTION_CONFIRM = True
+# False (default) -> the KRONOS DIRECTION IS THE ONLY GATE: buy the option at
+#          the first candle after the signal. No option-premium SMMA cross-up
+#          is required. The swing-low stop + percentage ladder still manage the
+#          exit. This is the intended Kronos behaviour.
+# True  -> also require the option premium's own 2-close SMMA cross-up before
+#          buying (the old double gate; it rejected ~93% of signals).
+KRONOS_REQUIRE_OPTION_CONFIRM = False
