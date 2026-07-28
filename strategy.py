@@ -435,7 +435,8 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
     def __init__(self, sma_period: int = 18, swing_k: int = 2,
                  swing_lookback: int = 10, fallback_risk_pct: float = 20.0,
                  ladder_start_pct: float = 30.0, ladder_step_pct: float = 20.0,
-                 ladder_lock_offset_pct: float = 20.0):
+                 ladder_lock_offset_pct: float = 20.0,
+                 min_stop_pct: float = 0.0, max_stop_pct: float = 100.0):
         super().__init__(sma_period=sma_period, long_only=True,
                          trail_mode="pct_ladder", ladder_start_pct=ladder_start_pct,
                          ladder_step_pct=ladder_step_pct,
@@ -443,6 +444,25 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
         self.swing_k = swing_k
         self.swing_lookback = swing_lookback
         self.fallback_risk_pct = fallback_risk_pct
+        # A raw swing low on a 3-min option premium is arbitrary: observed
+        # stops ranged from 1.6% to 43% of premium (a 27x spread). A stop
+        # tighter than the ladder's first lock can never be protected (a 1.6%
+        # stop needs a 19:1 move to reach +30%), and a 43% stop risks half the
+        # premium. Clamping keeps risk commensurate with the ladder.
+        self.min_stop_pct = min_stop_pct
+        self.max_stop_pct = max_stop_pct
+
+    def _stop_for(self, entry: float) -> float:
+        """Swing-low stop, clamped to [min_stop_pct, max_stop_pct] of entry."""
+        swing = self._recent_swing_low()
+        sl = swing if (swing is not None and swing < entry) else \
+            entry * (1.0 - self.fallback_risk_pct / 100.0)
+        dist_pct = (entry - sl) / entry * 100.0
+        if self.min_stop_pct and dist_pct < self.min_stop_pct:
+            sl = entry * (1.0 - self.min_stop_pct / 100.0)
+        elif self.max_stop_pct and dist_pct > self.max_stop_pct:
+            sl = entry * (1.0 - self.max_stop_pct / 100.0)
+        return sl
 
     def _process_idle(self, candle, sma):
         if sma is None or len(self._candles) < 2:
@@ -458,11 +478,7 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
                 and self._seen_close_below):
             self._seen_close_below = False
             entry = candle.close
-            swing = self._recent_swing_low()
-            if swing is not None and swing < entry:
-                sl = swing
-            else:  # degenerate (no valid swing below entry) -> % fallback stop
-                sl = entry * (1.0 - self.fallback_risk_pct / 100.0)
+            sl = self._stop_for(entry)
             self.state = "IN_POSITION"
             self.direction = "LONG"
             self.entry_price = entry
@@ -501,11 +517,7 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
             self._candles.append(candle)
             self._sma_history.append(sma)
         entry = candle.close
-        swing = self._recent_swing_low()
-        if swing is not None and swing < entry:
-            sl = swing
-        else:
-            sl = entry * (1.0 - self.fallback_risk_pct / 100.0)
+        sl = self._stop_for(entry)
         self.state = "IN_POSITION"
         self.direction = "LONG"
         self.entry_price = entry

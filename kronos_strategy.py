@@ -359,6 +359,8 @@ class KronosOptionBacktest:
         self.decision_every = decision_every or config.KRONOS_DECISION_EVERY
         self.validity = validity or config.OPTION_CONFIRM_VALIDITY
         self.target_pct = config.OPTION_TARGET_PREMIUM_PCT if target_pct is None else target_pct
+        self.loss_cooldown = getattr(config, "KRONOS_LOSS_COOLDOWN_CANDLES", 0)
+        self.max_losses_per_day = getattr(config, "KRONOS_MAX_LOSSES_PER_DAY", 0)
 
     # -- option data (throttled fetch + retry, no poisoning) --------------
     def _option_candles(self, client, token, day, cache, skips, when, otype):
@@ -383,10 +385,16 @@ class KronosOptionBacktest:
     def replay_day(self, index_day, warmup, scrip, day, client, cache):
         trades, skips = [], []
         busy_until = None
+        cooldown_until = None   # set after a loss, to stop same-move churn
+        losses = 0
         history = list(warmup)   # rolling context (prior sessions + intraday)
         for i, c in enumerate(index_day):
             history.append(c)
             if busy_until and c.timestamp <= busy_until:
+                continue
+            if self.max_losses_per_day and losses >= self.max_losses_per_day:
+                continue
+            if cooldown_until and c.timestamp < cooldown_until:
                 continue
             if i % self.decision_every != 0:
                 continue
@@ -426,9 +434,88 @@ class KronosOptionBacktest:
                            pred_move=(fc.move_pct if fc else 0.0))
                 trades.append(res)
                 busy_until = res["exit_time"]
+                if move < 0:
+                    losses += 1
+                    if self.loss_cooldown:
+                        step = timedelta(seconds=_INTERVAL_SECONDS.get(INTERVAL, 180))
+                        cooldown_until = res["exit_time"] + step * self.loss_cooldown
             else:
                 skips.append((c.timestamp, otype, res.get("reason", "no_confirm")))
         return trades, skips
+
+
+def diagnose_signal(client, forecaster, index_name, n_days):
+    """Measure Kronos's raw directional accuracy on the INDEX - no options, no
+    stops, no theta. This isolates signal quality from execution: if the hit
+    rate is ~50%, no amount of stop/ladder tuning will make the strategy work.
+
+    For each decision point we compare the predicted move against the index's
+    ACTUAL move over the same horizon, and bucket by predicted magnitude."""
+    ic = config.index_config(index_name)
+    strat = KronosSignalStrategy(forecaster)
+    horizon, thr = strat.horizon, strat.threshold_pct
+    every = config.KRONOS_DECISION_EVERY
+    calendar_days = max(21, int(n_days * 1.7) + 7)
+    candles = _fetch_index(client, ic, calendar_days)
+    all_dates = sorted({c.timestamp.date() for c in candles})
+    target = all_dates[-n_days:]
+
+    print(f"KRONOS SIGNAL DIAGNOSTIC - {index_name} ({INTERVAL})")
+    print(f"horizon={horizon} candles  threshold={thr}%  sessions={len(target)}")
+    print("Measures the model alone: predicted direction vs the index's actual "
+          "move over the same horizon.\n")
+
+    recs = []
+    for day in target:
+        warm = [c for c in candles if c.timestamp.date() < day]
+        day_c = [c for c in candles if c.timestamp.date() == day]
+        hist = list(warm)
+        for i, c in enumerate(day_c):
+            hist.append(c)
+            if i % every != 0:
+                continue
+            fut = day_c[i + 1:i + 1 + horizon]
+            if len(fut) < horizon:
+                break
+            window = hist[-strat.lookback:]
+            if len(window) < min(strat.lookback, 20):
+                continue      # too little context for a meaningful forecast
+            fc = forecaster.forecast(window, horizon)
+            actual = (fut[-1].close - c.close) / c.close * 100.0
+            recs.append((fc.move_pct, actual))
+
+    if not recs:
+        print("No decision points with a full horizon of forward data.")
+        return
+
+    def report(label, rows):
+        if not rows:
+            print(f"  {label:<22} (none)")
+            return
+        hits = sum(1 for p, a in rows if (p > 0) == (a > 0))
+        mean_a = sum(a for _p, a in rows) / len(rows)
+        # mean actual move in the predicted direction (the tradeable edge)
+        edge = sum(a if p > 0 else -a for p, a in rows) / len(rows)
+        print(f"  {label:<22} n={len(rows):<5} hit={hits/len(rows):>5.1%}  "
+              f"mean actual={mean_a:+.3f}%  edge={edge:+.4f}%")
+
+    print("Directional accuracy (50% = coin flip, no edge):")
+    report("all forecasts", recs)
+    fired = [r for r in recs if abs(r[0]) >= thr]
+    report(f"|pred| >= {thr}% (traded)", fired)
+    for lo, hi in ((thr, 0.25), (0.25, 0.4), (0.4, 99)):
+        report(f"|pred| {lo}-{hi}%", [r for r in recs if lo <= abs(r[0]) < hi])
+    ups = [r for r in fired if r[0] > 0]
+    dns = [r for r in fired if r[0] < 0]
+    print("\nBias check (a healthy model should fire both ways):")
+    report("predicted UP (CE)", ups)
+    report("predicted DOWN (PE)", dns)
+    print(f"\n  UP/DOWN split: {len(ups)} / {len(dns)}")
+    print("\nHow to read this: 'edge' is the mean index move in the predicted")
+    print("direction. It must comfortably exceed option spread + theta to be")
+    print("tradeable. An edge near 0 (or hit rate near 50%) means the signal")
+    print("itself has no value at this horizon/threshold - tuning stops cannot")
+    print("fix that; change the horizon/threshold/model or drop the strategy.")
 
 
 def _fetch_index(client, ic, calendar_days):
@@ -495,18 +582,32 @@ def main():
     ap.add_argument("offset", nargs="?", type=int, default=config.STRIKE_OFFSET,
                     help="signed strike offset (+OTM / -ITM)")
     ap.add_argument("days", nargs="?", type=int, default=5, help="sessions to test")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="measure the model's raw directional accuracy on the "
+                         "index (no options/stops/theta) instead of backtesting")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="override KRONOS_THRESHOLD_PCT for this run")
+    ap.add_argument("--horizon", type=int, default=None,
+                    help="override KRONOS_HORIZON for this run")
     args = ap.parse_args()
 
     index_name = args.index.upper()
     if index_name not in config.INDEXES:
         raise SystemExit(f"Unknown index {index_name}; choose from {list(config.INDEXES)}")
+    if args.threshold is not None:
+        config.KRONOS_THRESHOLD_PCT = args.threshold
+    if args.horizon is not None:
+        config.KRONOS_HORIZON = args.horizon
 
     client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
     client.login()
-    scrip = load_scrip_master()
 
     forecaster = KronosForecaster()   # loads the real model lazily on first use
-    run_backtest(client, forecaster, index_name, args.offset, args.days, scrip)
+    if args.diagnose:
+        diagnose_signal(client, forecaster, index_name, args.days)
+    else:
+        scrip = load_scrip_master()
+        run_backtest(client, forecaster, index_name, args.offset, args.days, scrip)
     client.logout()
 
 

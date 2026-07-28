@@ -75,6 +75,12 @@ OPTION_SWING_K = 2
 OPTION_SWING_LOOKBACK = 10
 # Fallback stop distance (% below entry) if no swing low sits below entry.
 OPTION_FALLBACK_RISK_PCT = 20.0
+# Clamp the swing-low stop to a sane band, as % of the entry premium. Raw
+# swing lows on a 3-min premium chart ranged 1.6%-43% in testing (27x spread):
+# anything tighter than the ladder's first lock can never be protected, and a
+# 40%+ stop risks half the premium. Set MIN to 0 to disable clamping.
+OPTION_MIN_STOP_PCT = 12.0
+OPTION_MAX_STOP_PCT = 25.0
 
 # Book the whole option position when the premium gains this fraction
 # (1.0 = +100%). Only used by the "premium_pct" option-leg mode.
@@ -189,3 +195,9 @@ KRONOS_SAMPLE_COUNT = 1       # prediction paths to average
 # True  -> also require the option premium's own 2-close SMMA cross-up before
 #          buying (the old double gate; it rejected ~93% of signals).
 KRONOS_REQUIRE_OPTION_CONFIRM = False
+# After a losing trade, wait this many candles before taking another signal.
+# Without it the bot churned 4 consecutive losers in one morning (2026-07-22),
+# re-entering the same direction every ~30 min into the same adverse move.
+KRONOS_LOSS_COOLDOWN_CANDLES = 10
+# Stop trading for the day after this many losses (0 = no cap).
+KRONOS_MAX_LOSSES_PER_DAY = 3
