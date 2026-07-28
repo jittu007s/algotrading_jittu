@@ -267,6 +267,27 @@ class KronosForecaster:
         last = candles[-1].timestamp
         y_timestamp = pd.Series([pd.Timestamp(last + step * (i + 1)) for i in range(horizon)])
 
+        # Kronos SAMPLES its forecast, so identical inputs normally give
+        # different outputs each run - which makes backtests unrepeatable and
+        # config comparisons meaningless. Seeding from the window's last
+        # timestamp makes each forecast a pure function of its data.
+        if getattr(config, "KRONOS_DETERMINISTIC", False):
+            seed = int(last.timestamp()) & 0x7FFFFFFF
+            try:
+                import torch
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            except ImportError:
+                pass
+            import random
+            random.seed(seed)
+            try:
+                import numpy as np
+                np.random.seed(seed)
+            except ImportError:
+                pass
+
         pred = self._predictor.predict(
             df=x_df, x_timestamp=x_timestamp, y_timestamp=y_timestamp,
             pred_len=horizon, T=self.T, top_p=self.top_p,
@@ -450,6 +471,13 @@ class KronosOptionBacktest:
                                              lambda: build_option_leg(self.target_pct),
                                              carry_forward=carry)
             if res.get("confirmed"):
+                # min-premium guard: a near-zero premium sizes to absurd,
+                # unfillable quantities and is pure lottery decay
+                min_prem = getattr(config, "OPTION_MIN_PREMIUM", 0.0)
+                if min_prem and res["entry"] < min_prem:
+                    skips.append((c.timestamp, otype,
+                                  f"premium {res['entry']:.2f} < min {min_prem:.0f}"))
+                    continue
                 move = res["exit"] - res["entry"]
                 # size the trade the same way the live bot would
                 sz = compute_size(getattr(config, "CAPITAL_FALLBACK", None), res["entry"],

@@ -88,6 +88,11 @@ OPTION_SWING_K = 2
 OPTION_SWING_LOOKBACK = 10
 # Fallback stop distance (% below entry) if no swing low sits below entry.
 OPTION_FALLBACK_RISK_PCT = 20.0
+# Never buy an option whose premium is below this (rupees). Sizing 50% of
+# funds into a sub-Rs-20 premium produces absurd quantities (a Rs 0.75 option
+# once sized to 1,025 lots) that could never actually be filled, and such
+# deep-decay contracts are lottery tickets, not trades.
+OPTION_MIN_PREMIUM = 20.0
 # Clamp the swing-low stop to a sane band, as % of the entry premium. Raw
 # swing lows on a 3-min premium chart ranged 1.6%-43% in testing (27x spread):
 # anything tighter than the ladder's first lock can never be protected, and a
@@ -219,6 +224,12 @@ KRONOS_DECISION_EVERY = 5     # forecast every N candles while flat (throttle co
 KRONOS_T = 1.0                # sampling temperature
 KRONOS_TOP_P = 0.9            # nucleus sampling
 KRONOS_SAMPLE_COUNT = 1       # prediction paths to average
+# Kronos SAMPLES its forecast (T/top_p), so two runs over the same candles
+# give different predictions - and two backtests give different trades,
+# making before/after comparisons meaningless. When True, the RNG is seeded
+# from each forecast window's last timestamp, so identical data always yields
+# the identical forecast (repeatable backtests, comparable config changes).
+KRONOS_DETERMINISTIC = True
 # False (default) -> the KRONOS DIRECTION IS THE ONLY GATE: buy the option at
 #          the first candle after the signal. No option-premium SMMA cross-up
 #          is required. The swing-low stop + percentage ladder still manage the

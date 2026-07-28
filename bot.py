@@ -141,6 +141,13 @@ def available_capital(client):
 
 def size_order(client, option, premium):
     """Lots/quantity for this option buy (50% of funds, min 2 lots)."""
+    min_prem = getattr(config, "OPTION_MIN_PREMIUM", 0.0)
+    if min_prem and premium is not None and premium < min_prem:
+        # a near-zero premium sizes to absurd, unfillable quantities
+        from sizing import Sizing
+        return Sizing(0, 0, 0.0,
+                      f"premium {premium:.2f} below OPTION_MIN_PREMIUM {min_prem:.0f}",
+                      False)
     lot_size = option.get("lotsize") or config.LOT_SIZE
     s = compute_size(available_capital(client), premium, lot_size,
                      utilisation_pct=config.FUND_UTILISATION_PCT,
