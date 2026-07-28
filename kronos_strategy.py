@@ -37,6 +37,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
 from typing import List
 
+# Import torch BEFORE pandas / numpy / the broker SDK. On Windows those pull in
+# their own MKL/OpenMP DLLs, and if they load first torch's native init can die
+# with "[WinError 1114] ... c10.dll". Importing it first is harmless elsewhere,
+# and staying quiet here keeps non-Kronos users unaffected (the real, actionable
+# error is raised later by _load_kronos()).
+try:
+    import torch as _torch  # noqa: F401
+except Exception:
+    _torch = None
+
 import config
 from instruments import find_offset_option
 from strategy import Candle, ExitReason, OptionPremiumStrategy, Signal
@@ -104,6 +114,27 @@ def _load_kronos():
         for cand in (repo, os.path.join(repo, "Kronos")):
             if os.path.isdir(cand) and cand not in sys.path:
                 sys.path.insert(0, cand)
+
+    # Import torch FIRST. On Windows, loading pandas/numpy/SmartApi (which pull
+    # their own MKL/OpenMP DLLs) before torch can break torch's native init
+    # with "[WinError 1114] ... c10.dll". Importing torch up front usually
+    # avoids that, and if torch itself is broken we report it clearly rather
+    # than burying it under seven failed module guesses.
+    try:
+        import torch  # noqa: F401
+    except Exception as exc:
+        raise ImportError(
+            f"PyTorch failed to load ({type(exc).__name__}: {exc}).\n"
+            "This is a torch installation problem, not a Kronos one. On Windows "
+            "'[WinError 1114] ... c10.dll' usually means:\n"
+            "  * the Microsoft Visual C++ Redistributable is missing - install "
+            "the x64 vc_redist from Microsoft, or\n"
+            "  * a CPU/CUDA build mismatch - reinstall a clean CPU build:\n"
+            "      pip uninstall -y torch\n"
+            "      pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
+            "  * a DLL clash with another native package (numpy/MKL). Try a fresh "
+            "venv, or set KMP_DUPLICATE_LIB_OK=TRUE.\n"
+            "Verify with:  python -c \"import torch; print(torch.__version__)\"") from exc
 
     names = ("Kronos", "KronosTokenizer", "KronosPredictor")
     # `model` / `model.kronos` are the real homes; the rest are fallbacks for
