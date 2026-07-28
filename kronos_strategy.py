@@ -91,7 +91,12 @@ class Forecast:
 
 def _load_kronos():
     """Import Kronos, honouring config.KRONOS_REPO_PATH (a clone of
-    github.com/shiyu-coder/Kronos) so you need not set PYTHONPATH."""
+    github.com/shiyu-coder/Kronos) so you need not set PYTHONPATH.
+
+    Returns (Kronos, KronosTokenizer, KronosPredictor). Only a module that
+    actually exposes all three classes is accepted - so a bare `Kronos`
+    namespace folder is never returned by mistake - and if nothing works the
+    real underlying import errors (e.g. a missing torch/einops) are surfaced."""
     repo = getattr(config, "KRONOS_REPO_PATH", None)
     if repo:
         # accept either the repo root (contains the `model/` package) or its
@@ -99,21 +104,37 @@ def _load_kronos():
         for cand in (repo, os.path.join(repo, "Kronos")):
             if os.path.isdir(cand) and cand not in sys.path:
                 sys.path.insert(0, cand)
-    for mod in ("model", "kronos", "Kronos"):
+
+    names = ("Kronos", "KronosTokenizer", "KronosPredictor")
+    # `model` / `model.kronos` are the real homes; the rest are fallbacks for
+    # other clone layouts. Bare `Kronos`/`kronos` are tried last and only used
+    # if they truly carry the classes (attribute check below).
+    candidates = ("model", "model.kronos", "Kronos.model", "Kronos.model.kronos",
+                  "kronos.model", "kronos", "Kronos")
+    errors = []
+    for modname in candidates:
         try:
-            m = __import__(mod, fromlist=["Kronos", "KronosTokenizer", "KronosPredictor"])
-            return m.Kronos, m.KronosTokenizer, m.KronosPredictor
-        except ImportError:
+            m = __import__(modname, fromlist=list(names))
+        except Exception as exc:   # ModuleNotFoundError, torch import errors, ...
+            errors.append(f"{modname}: {type(exc).__name__}: {exc}")
             continue
+        for target in (m, getattr(m, "model", None)):
+            if target is not None and all(hasattr(target, n) for n in names):
+                return target.Kronos, target.KronosTokenizer, target.KronosPredictor
+        errors.append(f"{modname}: imported but missing {names}")
+
+    tried = "\n  ".join(errors)
     raise ImportError(
-        "Kronos is not importable. Steps (Windows shown):\n"
+        "Kronos could not be loaded. Checklist:\n"
         "  1) git clone https://github.com/shiyu-coder/Kronos\n"
-        "  2) pip install -r requirements-kronos.txt  (torch, pandas, huggingface_hub, ...)\n"
-        "  3) point the bot at the clone WITHOUT touching PYTHONPATH by setting\n"
-        "     in config.py:  KRONOS_REPO_PATH = r\"C:\\\\path\\\\to\\\\Kronos\"\n"
-        "     (the folder that contains the `model` package), OR\n"
-        "     set PYTHONPATH to that folder before running.\n"
-        "The `model` package must expose Kronos, KronosTokenizer, KronosPredictor.")
+        "  2) pip install -r requirements-kronos.txt   (torch, einops, "
+        "huggingface_hub, safetensors, ...)\n"
+        "  3) config.py:  KRONOS_REPO_PATH = r\"C:\\\\path\\\\to\\\\Kronos\"  "
+        "(the folder containing the `model` package)\n"
+        "The `model` package must expose Kronos, KronosTokenizer, KronosPredictor.\n"
+        "Tip: the errors below usually name a MISSING DEPENDENCY (e.g. torch) - "
+        "install it and retry.\n"
+        f"Import attempts:\n  {tried}")
 
 
 class KronosForecaster:
