@@ -110,6 +110,12 @@ def simulate_option_leg(ocandles, signal_time, validity, target_pct):
         if entry is None:
             age += 1
             if ev.signal == Signal.ENTER_LONG_CE:
+                # The live bot refuses a NEW position at/after the cutoff, so
+                # the backtest must too - otherwise it books trades that could
+                # never have been taken (and that get squared off minutes later).
+                if c.timestamp.time() >= NO_ENTRY_AFTER:
+                    strat.force_exit(price=None)
+                    return dict(confirmed=False, reason="confirm_past_entry_cutoff")
                 entry, entry_time, sl, target = ev.price, c.timestamp, ev.stop_loss, ev.target
             elif age > validity:
                 return dict(confirmed=False, reason="no_confirm")

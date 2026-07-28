@@ -283,6 +283,9 @@ def simulate_option_direct(ocandles, signal_time, build_leg):
     first = post[0]
     if first.timestamp.time() >= SQUARE_OFF:
         return dict(confirmed=False, reason="eod_before_entry")
+    # match the live bot: no NEW position at/after the no-entry cutoff
+    if first.timestamp.time() >= NO_ENTRY_AFTER:
+        return dict(confirmed=False, reason="entry_past_cutoff")
     ev = strat.force_enter_long(first)
     entry, sl, entry_time = ev.price, ev.stop_loss, first.timestamp
 
