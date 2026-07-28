@@ -101,7 +101,7 @@ def index_config(name: str = None) -> dict:
 
 # Which strategy the live bot runs: "SMMA_CROSS" (the original rules) or
 # "ORB" (Opening Range Breakout). backtest_today.py always compares both.
-STRATEGY = "PULLBACK"   # "PULLBACK" | "FVG_RETEST" | "ORB" | "SMMA_CROSS" | "REGIME"
+STRATEGY = "PULLBACK"   # "PULLBACK" | "FVG_RETEST" | "ORB" | "SMMA_CROSS" | "REGIME" | "KRONOS"
 OR_MINUTES = 15             # ORB: opening range = first N minutes of the session
 ORB_MAX_RISK_POINTS = 80   # ORB: skip the trade if the range (= risk) is wider
 ORB_EXTENDED_TARGET_R = 3.0   # after 2R the target extends to this R multiple

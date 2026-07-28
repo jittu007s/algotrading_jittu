@@ -507,11 +507,149 @@ def sell_held(client, held, event):
             producttype=config.PRODUCT_TYPE)
 
 
+# ---------------------------------------------------------------------------
+# KRONOS mode: the Kronos foundation model forecasts the INDEX and its predicted
+# move picks a side (CE up / PE down). The option leg (STRIKE_OFFSET strikes
+# OTM/ITM) then executes - either waiting for the option premium's own 2-close
+# cross-up (KRONOS_REQUIRE_OPTION_CONFIRM=True) or entering directly - and the
+# percentage-ladder manages the exit. Reuses the two-stage option machinery;
+# only the stage-1 signal differs.
+# ---------------------------------------------------------------------------
+
+def run_kronos_option_loop(client, scrip_master, forecaster):
+    from kronos_strategy import KronosSignalStrategy
+
+    ic = config.index_config()
+    interval = config.CANDLE_INTERVAL
+    interval_s = INTERVAL_SECONDS[interval]
+    signal_strategy = KronosSignalStrategy(forecaster)
+    require_confirm = getattr(config, "KRONOS_REQUIRE_OPTION_CONFIRM", True)
+    decision_every = config.KRONOS_DECISION_EVERY
+    hist_cap = max(config.KRONOS_LOOKBACK + 50, 600)
+
+    index_hist = []          # rolling index-candle context for the model
+    index_last_ts = None
+    since_decision = 0
+    pending = None           # dict{option, otype, strat, last_ts, age, direct}
+    held = None              # dict{symbol, token, quantity, strat, last_ts, otype}
+    start_time = datetime.now()
+
+    logger.info("Bot started (KRONOS). index=%s offset=%+d DRY_RUN=%s interval=%s "
+                "lookback=%s horizon=%s threshold=%.2f%% confirm=%s",
+                config.INDEX, config.STRIKE_OFFSET, config.DRY_RUN, interval,
+                config.KRONOS_LOOKBACK, config.KRONOS_HORIZON,
+                config.KRONOS_THRESHOLD_PCT, require_confirm)
+
+    def option_candles(token, last_ts):
+        return fetch_candles_since(client, token, ic["option_exchange"], interval, last_ts)
+
+    while True:
+        try:
+            now = datetime.now()
+
+            if held and is_past_square_off(now):
+                event = held["strat"].force_exit(price=None)
+                sell_held(client, held, event)
+                held = None
+
+            # -- manage an open option position ------------------------------
+            if held:
+                for candle in option_candles(held["token"], held["last_ts"]):
+                    held["last_ts"] = candle.timestamp
+                    event = held["strat"].on_closed_candle(candle)
+                    if event.note:
+                        logger.info("[%s %s] %s", held["otype"], held["symbol"], event.note)
+                    if event.signal == Signal.EXIT:
+                        sell_held(client, held, event)
+                        held = None
+                        break
+
+            # -- confirm/enter the option after a Kronos signal --------------
+            if pending and not held:
+                for candle in option_candles(pending["option"]["token"], pending["last_ts"]):
+                    pending["last_ts"] = candle.timestamp
+                    pending["age"] += 1
+                    if pending["direct"]:
+                        if is_past_entry_cutoff(datetime.now()):
+                            logger.info("[%s] direct entry suppressed - past cutoff", pending["otype"])
+                            pending = None
+                            break
+                        event = pending["strat"].force_enter_long(candle)
+                        held = buy_leg(client, pending, event)
+                        pending = None
+                        break
+                    event = pending["strat"].on_closed_candle(candle)
+                    if event.signal == Signal.ENTER_LONG_CE:
+                        if is_past_entry_cutoff(datetime.now()):
+                            pending["strat"].force_exit(price=None)
+                            logger.info("[%s] confirm suppressed - past cutoff", pending["otype"])
+                            pending = None
+                        else:
+                            held = buy_leg(client, pending, event)
+                            pending = None
+                        break
+                    if pending["age"] > config.OPTION_CONFIRM_VALIDITY:
+                        logger.info("[%s] option confirm expired (%d candles), dropping setup",
+                                    pending["otype"], pending["age"])
+                        pending = None
+                        break
+
+            # -- STAGE 1: Kronos forecasts the index -------------------------
+            for candle in fetch_candles_since(client, ic["under_token"],
+                                              ic["under_exchange"], interval, index_last_ts):
+                index_last_ts = candle.timestamp
+                index_hist.append(candle)
+                if len(index_hist) > hist_cap:
+                    del index_hist[:len(index_hist) - hist_cap]
+                is_live = candle.timestamp + timedelta(seconds=interval_s) > start_time
+                if not is_live or held is not None or pending is not None:
+                    continue
+                since_decision += 1
+                if since_decision < decision_every:
+                    continue
+                since_decision = 0
+                if is_past_entry_cutoff(datetime.now()):
+                    continue
+
+                signal, fc = signal_strategy.decide(index_hist)
+                if signal not in (Signal.ENTER_LONG_CE, Signal.ENTER_SHORT_PE):
+                    continue
+                otype = "CE" if signal == Signal.ENTER_LONG_CE else "PE"
+                try:
+                    option = resolve_leg_option(scrip_master, candle.close, otype, ic)
+                except LookupError as exc:
+                    logger.warning("Could not resolve %s option: %s", otype, exc)
+                    continue
+                strat = build_option_leg_strategy()
+                warm_from_history(client, strat, option["token"], ic["option_exchange"], interval)
+                pending = {"option": option, "otype": otype, "strat": strat,
+                           "last_ts": None, "age": 0, "direct": not require_confirm}
+                logger.info("[KRONOS] predict %+.2f%% -> %s %s (strike %s); %s",
+                            fc.move_pct if fc else 0.0, otype, option["symbol"],
+                            option["strike"], "direct entry" if not require_confirm else "await confirm")
+
+            time.sleep(seconds_until_next_candle(datetime.now()))
+
+        except Exception as exc:
+            if "rate" in str(exc).lower() or "AB1021" in str(exc) or "Too many requests" in str(exc):
+                logger.warning("Rate limited by Angel One; cooling down %ss",
+                               config.RATE_LIMIT_COOLDOWN_SECONDS)
+                time.sleep(config.RATE_LIMIT_COOLDOWN_SECONDS)
+            else:
+                logger.exception("Error in Kronos loop; retrying next candle")
+                time.sleep(seconds_until_next_candle(datetime.now()))
+
+
 def main():
     client = AngelBrokingClient(config.API_KEY, config.CLIENT_CODE, config.PASSWORD, config.TOTP_SECRET)
     client.login()
 
     scrip_master = load_scrip_master()
+
+    if config.STRATEGY == "KRONOS":
+        from kronos_strategy import KronosForecaster
+        run_kronos_option_loop(client, scrip_master, KronosForecaster())
+        return
 
     if config.STRATEGY == "SMMA_CROSS":
         mode = getattr(config, "SMMA_SOURCE", "INDEX")
