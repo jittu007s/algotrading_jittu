@@ -48,8 +48,21 @@ SMMA_SOURCE = "INDEX_THEN_OPTION"
 # Which index the bot trades. Its underlying candles drive stage 1.
 INDEX = "NIFTY"            # "NIFTY" | "BANKNIFTY" | "SENSEX"
 # Strikes away from ATM for the option leg, signed towards OTM:
-#   +N -> N strikes OTM,  -N -> N strikes ITM,  0 -> ATM.
-STRIKE_OFFSET = 2
+#   +N -> N strikes OTM,  -N -> N strikes ITM,  0 -> ATM (current setting).
+STRIKE_OFFSET = 0
+
+# --- Position sizing -------------------------------------------------------
+# Deploy this share of available capital per trade, but never fewer than
+# MIN_LOTS lots. The minimum overrides the percentage (2 lots may cost more
+# than 50% of a small account); it does NOT override affordability - if the
+# minimum costs more than the whole account the trade is skipped.
+FUND_UTILISATION_PCT = 50.0
+MIN_LOTS = 2
+# Capital to size against. None -> ask the broker (RMS available cash) at
+# entry and fall back to CAPITAL_FALLBACK if that call fails. Backtests always
+# use CAPITAL_FALLBACK since there is no live funds endpoint for a past day.
+CAPITAL = None
+CAPITAL_FALLBACK = 100000.0
 # Candles to wait for the option-chart crossover to confirm after the index
 # signal; if it does not confirm within this many candles the setup is dropped.
 OPTION_CONFIRM_VALIDITY = 10

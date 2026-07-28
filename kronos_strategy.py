@@ -49,6 +49,7 @@ except Exception:
 
 import config
 from instruments import find_offset_option
+from sizing import compute_size
 from strategy import Candle, ExitReason, OptionPremiumStrategy, Signal
 # Reuse the tested option-leg simulation, throttled fetch and builders.
 from backtest_option_chart import (build_option_leg, fetch_candles,
@@ -429,9 +430,16 @@ class KronosOptionBacktest:
                                              lambda: build_option_leg(self.target_pct))
             if res.get("confirmed"):
                 move = res["exit"] - res["entry"]
+                # size the trade the same way the live bot would
+                sz = compute_size(getattr(config, "CAPITAL_FALLBACK", None), res["entry"],
+                                  option["lotsize"] or config.LOT_SIZE,
+                                  utilisation_pct=config.FUND_UTILISATION_PCT,
+                                  min_lots=config.MIN_LOTS)
                 res.update(otype=otype, strike=option["strike"], symbol=option["symbol"],
                            index_time=c.timestamp, points=move, pct=move / res["entry"] * 100.0,
-                           pred_move=(fc.move_pct if fc else 0.0))
+                           pred_move=(fc.move_pct if fc else 0.0),
+                           lots=sz.lots, qty=sz.quantity, cost=sz.cost,
+                           rupees=move * sz.quantity if sz.ok else 0.0, sized_ok=sz.ok)
                 trades.append(res)
                 busy_until = res["exit_time"]
                 if move < 0:
@@ -542,7 +550,7 @@ def run_backtest(client, forecaster: KronosForecaster, index_name: str,
 
     cache = {}
     g_trades = g_wins = 0
-    g_points = g_pct = 0.0
+    g_points = g_pct = g_rupees = 0.0
     total_skips = 0
     for day in target_dates:
         warmup = [c for c in index_candles if c.timestamp.date() < day]
@@ -552,23 +560,30 @@ def run_backtest(client, forecaster: KronosForecaster, index_name: str,
         trades, skips = bt.replay_day(day_candles, warmup, scrip, day, client, cache)
         day_pts = sum(t["points"] for t in trades)
         day_pct = sum(t["pct"] for t in trades)
+        day_rs = sum(t.get("rupees", 0.0) for t in trades)
         wins = sum(1 for t in trades if t["points"] > 0)
         g_trades += len(trades); g_wins += wins
-        g_points += day_pts; g_pct += day_pct
+        g_points += day_pts; g_pct += day_pct; g_rupees += day_rs
         total_skips += len(skips)
         print(f"  {day}: {len(trades)} trade(s), premium net {day_pts:+.2f} pts "
-              f"({day_pct:+.1f}% on entry), {len(skips)} skipped")
+              f"({day_pct:+.1f}% on entry), P&L {day_rs:+,.0f}, {len(skips)} skipped")
         for t in trades:
             print(f"      {t['otype']} {t['strike']:.0f} pred{t['pred_move']:+.2f}% "
                   f"idx@{t['index_time']:%H:%M} buy {t['entry_time']:%H:%M} "
                   f"entry={t['entry']:.2f} sl={t['sl']:.2f} -> exit {t['exit_time']:%H:%M} "
-                  f"{t['exit']:.2f} ({t['reason']}) {t['points']:+.2f} ({t['pct']:+.1f}%)")
+                  f"{t['exit']:.2f} ({t['reason']}) {t['points']:+.2f} ({t['pct']:+.1f}%) "
+                  f"x{t.get('qty', 0)} ({t.get('lots', 0)} lots) = {t.get('rupees', 0.0):+,.0f}")
         for ts, otype, reason in skips:
             print(f"      · skip {ts:%H:%M} {otype}: {reason}")
 
     wr = (g_wins / g_trades) if g_trades else 0.0
+    cap = getattr(config, "CAPITAL_FALLBACK", 0.0) or 0.0
     print(f"\nTOTAL: {g_trades} trade(s), win rate {wr:.0%}, premium net {g_points:+.2f} pts "
           f"({g_pct:+.1f}% summed on entry), {total_skips} skipped")
+    print(f"P&L: {g_rupees:+,.0f}" + (f"  on capital {cap:,.0f} "
+          f"({g_rupees / cap * 100:+.1f}%)" if cap else "")
+          + f"   [sizing: {config.FUND_UTILISATION_PCT:.0f}% of funds, "
+            f"min {config.MIN_LOTS} lots, ATM offset {offset:+d}]")
 
 
 def main():

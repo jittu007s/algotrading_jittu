@@ -38,6 +38,31 @@ class AngelBrokingClient:
         except Exception:
             logger.warning("Logout call failed (non-fatal)", exc_info=True)
 
+    def get_available_funds(self):
+        """Available cash for trading, via SmartAPI's RMS limits. Returns a
+        float, or None if the call fails / the field is missing (callers then
+        fall back to config.CAPITAL). Field names have varied across API
+        revisions, so several are tried."""
+        try:
+            resp = self.smart_api.rmsLimit()
+        except Exception:
+            logger.warning("rmsLimit() failed; cannot read funds", exc_info=True)
+            return None
+        if not resp or not resp.get("status"):
+            logger.warning("rmsLimit() returned no data: %s", resp)
+            return None
+        data = resp.get("data") or {}
+        for key in ("availablecash", "availableCash", "net",
+                    "availableintradaypayin", "availablelimitmargin"):
+            val = data.get(key)
+            if val not in (None, "", "0"):
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        logger.warning("No usable cash field in rmsLimit data: %s", data)
+        return None
+
     def get_candles(self, exchange: str, symboltoken: str, interval: str,
                      from_dt: datetime, to_dt: datetime, retries: int = 3):
         """Returns a list of [timestamp, open, high, low, close, volume]."""

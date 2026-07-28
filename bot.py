@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import config
 from angel_api import AngelBrokingClient
 from instruments import find_atm_option, find_offset_option, load_scrip_master
+from sizing import compute_size
 from quant_strategy import RegimeAdaptiveStrategy
 from strategy import (Candle, FVGRetestStrategy, OpeningRangeBreakout,
                       OptionPremiumStrategy, PullbackConfirmStrategy, Signal,
@@ -120,16 +121,48 @@ def is_past_entry_cutoff(now):
     return (now.hour, now.minute) >= (h, m)
 
 
+def available_capital(client):
+    """Capital to size against: config.CAPITAL if set, else the broker's RMS
+    available cash, else CAPITAL_FALLBACK."""
+    if getattr(config, "CAPITAL", None):
+        return float(config.CAPITAL)
+    funds = None
+    try:
+        funds = client.get_available_funds()
+    except Exception:
+        logger.warning("Could not read broker funds", exc_info=True)
+    if funds:
+        return funds
+    fallback = getattr(config, "CAPITAL_FALLBACK", None)
+    logger.warning("Using CAPITAL_FALLBACK=%s for sizing", fallback)
+    return fallback
+
+
+def size_order(client, option, premium):
+    """Lots/quantity for this option buy (50% of funds, min 2 lots)."""
+    lot_size = option.get("lotsize") or config.LOT_SIZE
+    s = compute_size(available_capital(client), premium, lot_size,
+                     utilisation_pct=config.FUND_UTILISATION_PCT,
+                     min_lots=config.MIN_LOTS)
+    return s
+
+
 def enter_position(client, scrip_master, candle, event, option_type):
     option = find_atm_option(
         scrip_master, candle.close, option_type=option_type,
         underlying=config.UNDERLYING_NAME, strike_step=config.STRIKE_STEP,
     )
-    qty = option["lotsize"] or config.LOT_SIZE
+    s = size_order(client, option, event.price)
+    if not s.ok:
+        logger.warning("ENTRY skipped (%s) - %s", option["symbol"], s.reason)
+        return None
+    qty = s.quantity
     logger.info(
-        "ENTRY signal (%s) candle=%s entry=%.2f spot=%.2f -> BUY %s qty=%s | SL=%.2f target=%.2f",
+        "ENTRY signal (%s) candle=%s entry=%.2f spot=%.2f -> BUY %s qty=%s "
+        "(%d lots, cost~%.0f: %s) | SL=%.2f target=%.2f",
         option_type, candle.timestamp, event.price, candle.close,
-        option["symbol"], qty, event.stop_loss, event.target,
+        option["symbol"], qty, s.lots, s.cost, s.reason,
+        event.stop_loss, event.target,
     )
 
     if not config.DRY_RUN:
@@ -239,9 +272,15 @@ def warm_lane(client, lane, interval):
 
 
 def buy_option(client, lane, event):
-    qty = lane.lotsize or config.LOT_SIZE
-    logger.info("[%s] ENTRY %s option_price=%.2f qty=%s | SL=%.2f target=%.2f",
-                lane.option_type, lane.symbol, event.price, qty,
+    s = size_order(client, {"lotsize": lane.lotsize}, event.price)
+    if not s.ok:
+        logger.warning("[%s] ENTRY skipped (%s) - %s", lane.option_type, lane.symbol, s.reason)
+        lane.strategy.force_exit(price=None)
+        return
+    qty = s.quantity
+    logger.info("[%s] ENTRY %s option_price=%.2f qty=%s (%d lots, cost~%.0f: %s) "
+                "| SL=%.2f target=%.2f",
+                lane.option_type, lane.symbol, event.price, qty, s.lots, s.cost, s.reason,
                 event.stop_loss, event.target)
     if not config.DRY_RUN:
         client.place_market_order(
@@ -427,6 +466,8 @@ def run_index_option_confirm_loop(client, scrip_master):
                             pending = None
                         else:
                             held = buy_leg(client, pending, event)
+                            if held is None:
+                                pending["strat"].force_exit(price=None)
                             pending = None
                         break
                     if pending["age"] > config.OPTION_CONFIRM_VALIDITY:
@@ -484,10 +525,16 @@ def warm_from_history(client, strat, token, exchange, interval):
 
 def buy_leg(client, pending, event):
     option = pending["option"]
-    qty = option["lotsize"] or config.LOT_SIZE
+    s = size_order(client, option, event.price)
+    if not s.ok:
+        logger.warning("[STAGE2] BUY skipped (%s) - %s", option["symbol"], s.reason)
+        return None
+    qty = s.quantity
     target_txt = "ladder" if event.target is None else f"{event.target:.2f}"
-    logger.info("[STAGE2] CONFIRM %s option_price=%.2f qty=%s | SL=%.2f target=%s",
-                option["symbol"], event.price, qty, event.stop_loss, target_txt)
+    logger.info("[STAGE2] CONFIRM %s option_price=%.2f qty=%s (%d lots, cost~%.0f: %s) "
+                "| SL=%.2f target=%s",
+                option["symbol"], event.price, qty, s.lots, s.cost, s.reason,
+                event.stop_loss, target_txt)
     if not config.DRY_RUN:
         client.place_market_order(
             exchange=config.index_config()["option_exchange"], tradingsymbol=option["symbol"],
@@ -578,6 +625,8 @@ def run_kronos_option_loop(client, scrip_master, forecaster):
                             break
                         event = pending["strat"].force_enter_long(candle)
                         held = buy_leg(client, pending, event)
+                        if held is None:
+                            pending["strat"].force_exit(price=None)
                         pending = None
                         break
                     event = pending["strat"].on_closed_candle(candle)
@@ -588,6 +637,8 @@ def run_kronos_option_loop(client, scrip_master, forecaster):
                             pending = None
                         else:
                             held = buy_leg(client, pending, event)
+                            if held is None:
+                                pending["strat"].force_exit(price=None)
                             pending = None
                         break
                     if pending["age"] > config.OPTION_CONFIRM_VALIDITY:
@@ -718,6 +769,9 @@ def main():
                     else:
                         option_type = "CE" if event.signal == Signal.ENTER_LONG_CE else "PE"
                         held_option = enter_position(client, scrip_master, candle, event, option_type)
+                        if held_option is None:
+                            # unaffordable -> no order, so don't hold strategy state
+                            strategy.force_exit(price=None)
                 elif event.signal == Signal.EXIT and held_option:
                     exit_position(client, held_option, event)
                     held_option = None
