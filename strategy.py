@@ -491,6 +491,32 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
         window = lows[-self.swing_lookback:]
         return min(window) if window else None
 
+    def force_enter_long(self, candle):
+        """Open a long immediately at `candle`'s close with the swing-low
+        stop, WITHOUT waiting for the 2-close cross-up. Used when an external
+        signal (e.g. a Kronos forecast) is the entry trigger; the percentage
+        ladder then manages the exit exactly as for a normal entry."""
+        if not self._candles or self._candles[-1].timestamp != candle.timestamp:
+            sma = self._update_smma(candle.close)
+            self._candles.append(candle)
+            self._sma_history.append(sma)
+        entry = candle.close
+        swing = self._recent_swing_low()
+        if swing is not None and swing < entry:
+            sl = swing
+        else:
+            sl = entry * (1.0 - self.fallback_risk_pct / 100.0)
+        self.state = "IN_POSITION"
+        self.direction = "LONG"
+        self.entry_price = entry
+        self.stop_loss = sl
+        self.target = None
+        self.trailing = False
+        self._risk = entry - sl
+        self.extreme_since_entry = candle.high
+        return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl,
+                             target=None, note="external direct entry")
+
 
 class OpeningRangeBreakout:
     """Opening Range Breakout with the full user-specified trade handling.

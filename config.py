@@ -159,3 +159,24 @@ RATE_LIMIT_COOLDOWN_SECONDS = 60
 # Pacing them avoids tripping Angel One's rate limit mid-run. Raise this if
 # you still see "exceeding access rate"; lower it to speed up a small backtest.
 BACKTEST_FETCH_MIN_INTERVAL = 1.5
+
+# --- Kronos foundation-model strategy (kronos_strategy.py) ------------------
+# Kronos forecasts the INDEX's next candles; the sign/size of the predicted
+# move picks a side (CE for up, PE for down) and the weekly option leg
+# (STRIKE_OFFSET strikes OTM/ITM) executes it. Requires the Kronos package and
+# model weights (see requirements-kronos.txt / README) - heavy, ideally a GPU.
+KRONOS_MODEL = "NeoQuasar/Kronos-small"          # HF model id or local path
+KRONOS_TOKENIZER = "NeoQuasar/Kronos-Tokenizer-base"
+KRONOS_DEVICE = None          # None -> auto (cuda if available, else cpu)
+KRONOS_MAX_CONTEXT = 512      # model context limit
+KRONOS_LOOKBACK = 256         # candles of history fed to the model per forecast
+KRONOS_HORIZON = 10           # candles ahead to predict (10 x 3min = 30 min)
+KRONOS_THRESHOLD_PCT = 0.15   # min predicted index move (%) to take a side
+KRONOS_DECISION_EVERY = 5     # forecast every N candles while flat (throttle compute)
+KRONOS_T = 1.0                # sampling temperature
+KRONOS_TOP_P = 0.9            # nucleus sampling
+KRONOS_SAMPLE_COUNT = 1       # prediction paths to average
+# True  -> after the Kronos direction, still require the option premium's own
+#          2-close cross-up confirmation (reuses the option leg's entry).
+# False -> enter the option directly at the first candle after the signal.
+KRONOS_REQUIRE_OPTION_CONFIRM = True

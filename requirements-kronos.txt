@@ -1,0 +1,22 @@
+# Extra dependencies for the Kronos foundation-model strategy (kronos_strategy.py).
+# These are HEAVY and separate from the core bot requirements. A CUDA GPU is
+# strongly recommended; CPU inference works but is slow.
+#
+# Kronos itself is not on PyPI as a clean package - clone the repo and put it
+# on PYTHONPATH so `from model import Kronos, KronosTokenizer, KronosPredictor`
+# resolves:
+#
+#   git clone https://github.com/shiyu-coder/Kronos
+#   export PYTHONPATH="$PYTHONPATH:/path/to/Kronos"
+#
+# The model + tokenizer weights are pulled from Hugging Face on first use
+# (config.KRONOS_MODEL / KRONOS_TOKENIZER), e.g. NeoQuasar/Kronos-small and
+# NeoQuasar/Kronos-Tokenizer-base.
+
+torch>=2.1
+pandas>=2.0
+numpy>=1.24
+huggingface_hub>=0.23
+safetensors
+einops
+tqdm
