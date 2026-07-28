@@ -165,6 +165,12 @@ BACKTEST_FETCH_MIN_INTERVAL = 1.5
 # move picks a side (CE for up, PE for down) and the weekly option leg
 # (STRIKE_OFFSET strikes OTM/ITM) executes it. Requires the Kronos package and
 # model weights (see requirements-kronos.txt / README) - heavy, ideally a GPU.
+# Path to your local clone of github.com/shiyu-coder/Kronos (the folder that
+# contains the `model` package). Set this so the loader can import Kronos
+# without you touching PYTHONPATH, e.g. on Windows:
+#   KRONOS_REPO_PATH = r"C:\Users\KUMARJ\Kronos"
+# Leave None if Kronos is already importable (installed / on PYTHONPATH).
+KRONOS_REPO_PATH = os.getenv("KRONOS_REPO_PATH") or None
 KRONOS_MODEL = "NeoQuasar/Kronos-small"          # HF model id or local path
 KRONOS_TOKENIZER = "NeoQuasar/Kronos-Tokenizer-base"
 KRONOS_DEVICE = None          # None -> auto (cuda if available, else cpu)

@@ -25,11 +25,23 @@ open-source foundation model for financial candlesticks — to forecast the
 ```bash
 pip install -r requirements-kronos.txt
 git clone https://github.com/shiyu-coder/Kronos
-export PYTHONPATH="$PYTHONPATH:/path/to/Kronos"   # so `from model import ...` works
 ```
 
-Model/tokenizer weights download from Hugging Face on first use
-(`config.KRONOS_MODEL`, `config.KRONOS_TOKENIZER`).
+Then point the bot at the clone. **Easiest (no PYTHONPATH needed):** set the
+path in `config.py` — it's the folder that contains the `model` package:
+
+```python
+# config.py
+KRONOS_REPO_PATH = r"C:\Users\KUMARJ\Kronos"      # Windows
+# KRONOS_REPO_PATH = "/home/you/Kronos"           # Linux/mac
+```
+
+or set the `KRONOS_REPO_PATH` environment variable, or add the clone to
+`PYTHONPATH` yourself. Model/tokenizer weights download from Hugging Face on
+first use (`config.KRONOS_MODEL`, `config.KRONOS_TOKENIZER`).
+
+> The `ImportError: Kronos is not importable` message means step 2/3 above is
+> missing — install the deps and set `KRONOS_REPO_PATH`.
 
 ## Backtest
 

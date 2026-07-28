@@ -30,6 +30,8 @@ amount columns Kronos expects are filled with zeros. Predictions still work but
 are driven by price alone.
 """
 
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
@@ -88,19 +90,30 @@ class Forecast:
 
 
 def _load_kronos():
-    """Import Kronos from whatever layout is installed, with a clear error."""
+    """Import Kronos, honouring config.KRONOS_REPO_PATH (a clone of
+    github.com/shiyu-coder/Kronos) so you need not set PYTHONPATH."""
+    repo = getattr(config, "KRONOS_REPO_PATH", None)
+    if repo:
+        # accept either the repo root (contains the `model/` package) or its
+        # parent, so a Windows path like C:\...\Kronos just works.
+        for cand in (repo, os.path.join(repo, "Kronos")):
+            if os.path.isdir(cand) and cand not in sys.path:
+                sys.path.insert(0, cand)
     for mod in ("model", "kronos", "Kronos"):
         try:
             m = __import__(mod, fromlist=["Kronos", "KronosTokenizer", "KronosPredictor"])
             return m.Kronos, m.KronosTokenizer, m.KronosPredictor
-        except Exception:
+        except ImportError:
             continue
     raise ImportError(
-        "Kronos is not importable. Install it, e.g.:\n"
-        "  git clone https://github.com/shiyu-coder/Kronos\n"
-        "  pip install -r Kronos/requirements.txt  (torch, huggingface_hub, ...)\n"
-        "and make its `model` package importable (add the clone to PYTHONPATH),\n"
-        "or `pip install kronos-forecasting` if a packaged build is available.")
+        "Kronos is not importable. Steps (Windows shown):\n"
+        "  1) git clone https://github.com/shiyu-coder/Kronos\n"
+        "  2) pip install -r requirements-kronos.txt  (torch, pandas, huggingface_hub, ...)\n"
+        "  3) point the bot at the clone WITHOUT touching PYTHONPATH by setting\n"
+        "     in config.py:  KRONOS_REPO_PATH = r\"C:\\\\path\\\\to\\\\Kronos\"\n"
+        "     (the folder that contains the `model` package), OR\n"
+        "     set PYTHONPATH to that folder before running.\n"
+        "The `model` package must expose Kronos, KronosTokenizer, KronosPredictor.")
 
 
 class KronosForecaster:
