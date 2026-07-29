@@ -76,6 +76,13 @@ OPTION_CONFIRM_VALIDITY = 10
 #            3rd-last candle low trailed to the 2nd-last, exit at +100%.
 OPTION_LEG_MODE = "premium_ladder"
 
+# Fixed bracket on the option premium: exit the whole position at
+# +OPTION_TARGET_PCT, stop out at -OPTION_STOP_PCT of entry. When set (not
+# None) these OVERRIDE the swing-low stop and the open-ended ladder below.
+# Set both to None to go back to swing-low stop + percentage-ladder trailing.
+OPTION_TARGET_PCT = 30.0
+OPTION_STOP_PCT = 10.0
+
 # Percentage ladder (used by "premium_ladder"). Defaults encode the spec:
 #   at +LADDER_START% lock (START-LOCK_OFFSET)%, every +LADDER_STEP% locks
 #   another step. 30 / 20 / 20 -> 30%->10%, 50%->30%, 70%->50%, ...

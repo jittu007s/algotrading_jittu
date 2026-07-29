@@ -351,6 +351,13 @@ class SmaCrossOptionStrategy:
             self._reset()
             return StrategyEvent(Signal.EXIT, exit_price, reason=reason)
 
+        # 1b. Fixed take-profit (when a bracket is configured): book the whole
+        #     position at the target instead of trailing further.
+        if self.target is not None and candle.high >= self.target:
+            exit_price = self.target
+            self._reset()
+            return StrategyEvent(Signal.EXIT, exit_price, reason=ExitReason.TARGET_HIT)
+
         # 2. Raise the stop up the ladder based on the peak gain this candle.
         gain_pct = (candle.high - self.entry_price) / self.entry_price * 100.0
         if gain_pct >= self.ladder_start_pct:
@@ -436,7 +443,8 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
                  swing_lookback: int = 10, fallback_risk_pct: float = 20.0,
                  ladder_start_pct: float = 30.0, ladder_step_pct: float = 20.0,
                  ladder_lock_offset_pct: float = 20.0,
-                 min_stop_pct: float = 0.0, max_stop_pct: float = 100.0):
+                 min_stop_pct: float = 0.0, max_stop_pct: float = 100.0,
+                 target_pct: float = None, stop_pct: float = None):
         super().__init__(sma_period=sma_period, long_only=True,
                          trail_mode="pct_ladder", ladder_start_pct=ladder_start_pct,
                          ladder_step_pct=ladder_step_pct,
@@ -451,6 +459,22 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
         # premium. Clamping keeps risk commensurate with the ladder.
         self.min_stop_pct = min_stop_pct
         self.max_stop_pct = max_stop_pct
+        # Fixed bracket (overrides the swing-low stop and the open-ended
+        # ladder when set): exit the whole position at +target_pct, stop out
+        # at -stop_pct of the entry premium.
+        self.fixed_target_pct = target_pct
+        self.fixed_stop_pct = stop_pct
+
+    def _bracket(self, entry: float):
+        """(stop_loss, target) for an entry: the fixed % bracket when
+        configured, else swing-low stop with no fixed target (ladder)."""
+        if self.fixed_stop_pct is not None:
+            sl = entry * (1.0 - self.fixed_stop_pct / 100.0)
+        else:
+            sl = self._stop_for(entry)
+        target = (entry * (1.0 + self.fixed_target_pct / 100.0)
+                  if self.fixed_target_pct is not None else None)
+        return sl, target
 
     def _stop_for(self, entry: float) -> float:
         """Swing-low stop, clamped to [min_stop_pct, max_stop_pct] of entry."""
@@ -478,17 +502,17 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
                 and self._seen_close_below):
             self._seen_close_below = False
             entry = candle.close
-            sl = self._stop_for(entry)
+            sl, target = self._bracket(entry)
             self.state = "IN_POSITION"
             self.direction = "LONG"
             self.entry_price = entry
             self.stop_loss = sl
-            self.target = None
+            self.target = target
             self.trailing = False
             self._risk = entry - sl
             self.extreme_since_entry = candle.high
             return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl,
-                                 target=None, note="option 2-close cross up")
+                                 target=target, note="option 2-close cross up")
         return StrategyEvent(Signal.NONE, candle.close)
 
     def _recent_swing_low(self):
@@ -517,17 +541,17 @@ class OptionPremiumStrategy(SmaCrossOptionStrategy):
             self._candles.append(candle)
             self._sma_history.append(sma)
         entry = candle.close
-        sl = self._stop_for(entry)
+        sl, target = self._bracket(entry)
         self.state = "IN_POSITION"
         self.direction = "LONG"
         self.entry_price = entry
         self.stop_loss = sl
-        self.target = None
+        self.target = target
         self.trailing = False
         self._risk = entry - sl
         self.extreme_since_entry = candle.high
         return StrategyEvent(Signal.ENTER_LONG_CE, entry, stop_loss=sl,
-                             target=None, note="external direct entry")
+                             target=target, note="external direct entry")
 
 
 class OpeningRangeBreakout:

@@ -406,7 +406,9 @@ def build_option_leg_strategy():
             ladder_step_pct=config.OPTION_LADDER_STEP_PCT,
             ladder_lock_offset_pct=config.OPTION_LADDER_LOCK_OFFSET_PCT,
             min_stop_pct=getattr(config, "OPTION_MIN_STOP_PCT", 0.0),
-            max_stop_pct=getattr(config, "OPTION_MAX_STOP_PCT", 100.0))
+            max_stop_pct=getattr(config, "OPTION_MAX_STOP_PCT", 100.0),
+            target_pct=getattr(config, "OPTION_TARGET_PCT", None),
+            stop_pct=getattr(config, "OPTION_STOP_PCT", None))
     return SmaCrossOptionStrategy(
         sma_period=config.SMA_PERIOD, risk_reward=config.RISK_REWARD, long_only=True,
         target_mode="premium_pct", target_premium_pct=config.OPTION_TARGET_PREMIUM_PCT,
